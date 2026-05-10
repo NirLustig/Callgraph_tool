@@ -88,8 +88,8 @@ HTML and DOT output do not require the Graphviz binary.
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo-name>.git
-cd <your-repo-name>
+git clone https://github.com/NirLustig/Callgraph_tool.git
+cd Callgraph_tool
 ```
 
 Create and activate a virtual environment:
