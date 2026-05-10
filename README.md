@@ -44,7 +44,7 @@ CallGraph Tool scans a source-code project, extracts functions and call relation
 ## Project Structure
 
 ```text
-callgraph_tool_v4_filenode/
+callgraph_tool/
 ├── callgraph/
 │   ├── cli.py                  # Command-line interface and pipeline orchestration
 │   ├── config.py               # YAML/JSON configuration loading
