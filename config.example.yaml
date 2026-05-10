@@ -1,0 +1,73 @@
+# CallGraph Tool - Example Configuration
+# Copy to config.yaml and customize as needed.
+
+display:
+  show_parameters: true      # Show function parameter names and types in nodes
+  show_return_types: true    # Show return type annotation in nodes
+  show_filenames: true       # Show source file name in nodes
+  show_line_numbers: false   # Show line number in nodes
+  show_classes: true         # Show parent class/namespace in nodes
+
+filter:
+  # Directories to skip entirely (supports glob patterns)
+  exclude_dirs:
+    - ".git"
+    - "__pycache__"
+    - "node_modules"
+    - "vendor"
+    - ".venv"
+    - "venv"
+    - "build"
+    - "dist"
+
+  # Only scan these directories (leave empty to scan all)
+  include_dirs: []
+
+  # Files to exclude (glob patterns against filename)
+  exclude_files: []
+
+  # Only include these files (leave empty to include all)
+  include_files: []
+
+  # Only include functions matching these patterns (fnmatch glob, leave empty for all)
+  include_functions: []
+
+  # Exclude functions matching these patterns
+  exclude_functions:
+    - "__init__"
+    - "__repr__"
+    - "__str__"
+    - "__del__"
+
+  # Maximum call depth from entry_points (null = unlimited)
+  max_depth: null
+
+  # Start graph from these function names (empty = show all)
+  # These become root nodes; max_depth is counted from here.
+  entry_points: []
+    # - "main"
+    # - "MyClass::render"
+
+  # Show calls to external/library functions that are not defined in the project
+  show_external: false
+
+variables:
+  # Enable tracking of specific variable names inside functions
+  track: false
+
+  # Variable names to track and display as annotation nodes
+  names: []
+    # - "buf_size"
+    # - "result"
+    # - "mode"
+
+output:
+  # Output format(s): html, svg, png, dot
+  formats:
+    - html
+
+  # Graph layout: "hierarchical" (top-down call tree) or "force" (physics-based clustering)
+  layout: "hierarchical"
+
+  # Maximum number of nodes before a warning is shown (helps keep graphs readable)
+  max_nodes: 300

@@ -1,0 +1,8 @@
+tree-sitter>=0.21.0
+tree-sitter-c>=0.21.0
+tree-sitter-cpp>=0.21.0
+networkx>=3.2,<4.0
+pyvis>=0.3.2,<0.4.0
+graphviz>=0.20.1,<0.21.0
+PyYAML>=6.0,<7.0
+rich>=13.0,<14.0

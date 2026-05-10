@@ -1,0 +1,9 @@
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CppSample", "CppSample.vcxproj", "{AABBCCDD-0000-0000-0000-000000000001}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Missing", "does_not_exist.vcxproj", "{AABBCCDD-0000-0000-0000-000000000002}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{AABBCCDD-0000-0000-0000-000000000003}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CSharpApp", "App.csproj", "{AABBCCDD-0000-0000-0000-000000000004}"
+EndProject

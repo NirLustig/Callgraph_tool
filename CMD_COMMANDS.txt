@@ -1,0 +1,221 @@
+========================================================
+  CallGraph Tool — Command Reference (Windows CMD / PowerShell)
+========================================================
+
+PREREQUISITES
+-------------
+  - Python 3.9+ installed and on PATH
+  - pip available
+  - (Optional) Graphviz binary for SVG/PNG output:
+      winget install graphviz
+
+
+SETUP
+-----
+  1. Enter the project folder:
+       cd C:\path\to\callgraph_tool
+
+  2. (Recommended) Create a virtual environment:
+       python -m venv .venv
+       .venv\Scripts\activate
+
+  3. Install dependencies:
+       pip install -r requirements.txt
+
+
+BASIC USAGE
+-----------
+  Analyze a project folder and produce an interactive HTML graph:
+       python callgraph_tool.py --project ./my_project --output graph.html
+
+  Analyze a Visual Studio Solution (.sln) file:
+       python callgraph_tool.py --project "C:\work\MyApp.sln" --output graph.html
+
+  With a config file:
+       python callgraph_tool.py --project ./my_project --config config.yaml --output graph.html
+
+  Multiple output formats (HTML + SVG):
+       python callgraph_tool.py --project ./my_project --output graph --formats html svg
+
+  Focus on a specific entry point, depth 3:
+       python callgraph_tool.py --project ./my_project --entry main --depth 3 --output graph.html
+
+  Show external/library calls too:
+       python callgraph_tool.py --project ./my_project --output graph.html --show-external
+
+  Verbose output (show parse errors per file):
+       python callgraph_tool.py --project ./my_project --output graph.html --verbose
+
+
+SUPPORTED LANGUAGES
+-------------------
+  .py             Python   (built-in ast module)
+  .c, .h          C        (Tree-sitter)
+  .cpp, .cc, .cxx, .hpp, .hxx, .hh   C++   (Tree-sitter)
+  .m              MATLAB   (regex-based)
+
+
+OUTPUT FORMATS
+--------------
+  html     Interactive graph with search, isolation, hover popups,
+           double-click inspection. Fully self-contained (no internet needed).
+  dot      Graphviz DOT text file (always written, no binary needed)
+  svg      Scalable vector graphic (requires Graphviz binary)
+  png      Raster image (requires Graphviz binary)
+
+
+USING THE HTML OUTPUT
+---------------------
+  Open the generated .html file in any modern browser (Chrome, Firefox, Edge).
+  No internet connection required — all assets are embedded.
+
+  VIEW MODES
+    The sidebar has two view mode buttons at the top:
+
+    "Function Nodes" (default)
+      Each node on the canvas is a single function.
+      Pan, zoom, and drag nodes freely.
+
+    "Script Nodes"
+      Each block is a source file/script.  Functions appear as rows inside
+      their file card.  Callee badges show:
+        green  — call to a function in the same file
+        orange — call to a function in another project file
+        gray   — call to an external/library function
+      Click a callee badge  → jump to and select that function's row
+      Click a function row  → select it and open the detail panel
+      Double-click a row    → open the full inspection modal
+      Click a file header   → highlight the file card
+
+    All sidebar buttons (Search, Highlight, Isolate, Expand, etc.) work
+    in both modes.  "Fit view" scrolls to the top in Script Nodes mode.
+    "Reset layout" is not applicable in Script Nodes mode.
+
+  FUNCTION NODES MODE — controls:
+    - Hover over a node   : quick function info popup
+    - Single-click        : select node, open detail panel on right
+    - Double-click        : full inspection modal (signature, calls, variables, ...)
+    - Drag node           : reposition (saved to browser localStorage)
+    - Search box + Enter  : highlight matching functions
+    - Highlight button    : select + zoom to search result
+    - Center button       : center view on first match
+    - Isolate button      : hide all nodes except the selected function + call tree
+    - Expand button       : make reachable nodes visible without hiding others
+    - Clear isolation     : show all nodes again
+    - Depth selector      : how many hops to follow for Isolate/Expand
+    - Direction selector  : callers only, callees only, or both
+    - Fit view            : zoom to fit all visible nodes
+    - Show all            : un-hide all nodes
+    - Reset layout        : restore original computed positions
+    - Clear saved         : erase saved positions from browser storage
+
+
+CONFIGURATION FILE
+------------------
+  Copy config.example.yaml and edit it:
+       copy config.example.yaml my_config.yaml
+       notepad my_config.yaml
+
+  Key settings:
+    filter:
+      exclude_dirs: [".git", "__pycache__", "tests", "vendor"]
+      exclude_functions: ["__init__", "__repr__", "helper_*"]
+      entry_points: ["main"]       # Focus from these functions
+      max_depth: 5                 # Null = unlimited
+      show_external: false         # Include stdlib/external calls
+
+    output:
+      formats: ["html", "svg"]
+      max_nodes: 3000              # Hard cap (warn at 500+)
+
+    variables:
+      track: true
+      names: ["buf_size", "mode", "result"]
+
+
+RUNNING TESTS
+-------------
+       pip install pytest
+       pytest tests/ -v
+
+  Run a specific test file:
+       pytest tests/test_python_parser.py -v
+
+
+TROUBLESHOOTING
+---------------
+  "No source files found"
+    - Check that --project points to the correct directory.
+    - Verify the project contains .py, .c, .cpp, or .m files.
+    - If using include_dirs in config, ensure the pattern matches.
+
+  "tree-sitter-c is not installed"
+    - Run: pip install tree-sitter tree-sitter-c tree-sitter-cpp
+
+  "pyvis is not installed"
+    - Run: pip install pyvis
+
+  "No module named yaml"
+    - Run: pip install PyYAML
+
+  Graphviz SVG/PNG fails with "dot not found"
+    - Install Graphviz: winget install graphviz
+    - Restart CMD/PowerShell after install so PATH is updated.
+    - The .dot text file is always written regardless.
+
+  HTML file opens but graph is blank
+    - The file might be very large. Try adding --entry and --depth to reduce scope.
+    - Check browser console (F12) for JavaScript errors.
+
+  Buttons (Isolate, Search, etc.) show "Not ready" briefly
+    - This is normal on first load while vis.js initializes.
+    - Wait 1-2 seconds then try again; or reload the page.
+
+  Nodes overlap
+    - For large graphs, use --entry and --depth to show a subset.
+    - Drag nodes to reposition; positions are auto-saved.
+
+
+VISUAL STUDIO SOLUTION INPUT
+-----------------------------
+  Pass a .sln file directly as --project.  The tool will:
+    1. Parse the solution to find all referenced C/C++ projects.
+    2. Read each .vcxproj to collect ClCompile / ClInclude source files.
+    3. Deduplicate files shared across projects.
+    4. Analyze all discovered files exactly as a normal C/C++ folder.
+    5. Cross-project calls are shown when the callee can be resolved.
+
+  Example:
+       python callgraph_tool.py --project "C:\work\MyApp.sln" --output graph.html
+
+  With depth limit (useful for large solutions):
+       python callgraph_tool.py --project "C:\work\MyApp.sln" --entry main --depth 4 --output graph.html
+
+  Show solution warnings (missing files, skipped projects, etc.):
+       python callgraph_tool.py --project "C:\work\MyApp.sln" --output graph.html --verbose
+
+  Notes:
+    - C#, F#, and VB.NET projects inside the .sln are automatically skipped.
+    - Solution folders (virtual containers) are automatically skipped.
+    - Build-condition guards on individual file items are ignored —
+      all listed files are analysed regardless of Debug/Release/platform.
+    - If a project file (.vcxproj) is missing, a warning is printed and
+      that project is skipped; the rest of the solution is still analysed.
+
+
+EXAMPLE WORKFLOW
+----------------
+  # Analyse a Visual Studio solution
+  python callgraph_tool.py --project C:\work\MyApp\MyApp.sln --output C:\tmp\myapp_graph.html
+
+  # Full project folder analysis
+  python callgraph_tool.py --project C:\work\myapp --output C:\tmp\myapp_graph.html
+
+  # Focus on one function, 4 levels deep
+  python callgraph_tool.py --project C:\work\myapp --entry process_request --depth 4 --output C:\tmp\focused.html
+
+  # Analyze only C++ files in a specific folder
+  python callgraph_tool.py --project C:\work\myapp\src --config cpp_only.yaml --output C:\tmp\cpp_graph.html
+
+  # Open the result
+  start C:\tmp\myapp_graph.html
