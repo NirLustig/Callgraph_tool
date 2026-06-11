@@ -37,7 +37,7 @@ CallGraph Analyzer scans your source code and produces a **fully self-contained 
 
 | Requirement | Version |
 |---|---|
-| Python | 3.9 or later |
+| Python | 3.12 or later |
 | pip | any recent version |
 | Graphviz binary *(optional)* | for SVG / PNG output — [graphviz.org](https://graphviz.org/download/) |
 
