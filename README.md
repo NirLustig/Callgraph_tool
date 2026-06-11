@@ -3,7 +3,7 @@
 > **Offline, self-contained static call-graph, variable-flow, and architecture analyser**  
 > for **C, C++, Python, and MATLAB** — with a single-file interactive HTML output.
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 
 ---
