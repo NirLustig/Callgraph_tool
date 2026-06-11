@@ -48,8 +48,8 @@ CallGraph Analyzer scans your source code and produces a **fully self-contained 
 ### 1 — Clone or download the project
 
 ```bash
-git clone https://github.com/your-username/callgraph-tool.git
-cd callgraph-tool
+git clone https://github.com/NirLustig/Callgraph_tool.git
+cd Callgraph_tool
 ```
 
 ### 2 — Create a virtual environment *(recommended)*
