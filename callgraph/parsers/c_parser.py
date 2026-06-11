@@ -1,18 +1,23 @@
 """
 C source parser using Tree-sitter.
 
-Known limitation: preprocessor macros are not expanded. Functions defined
-entirely via macros (e.g. DECLARE_HANDLER(foo, int)) will not be detected.
-For macro-heavy codebases, consider the libclang backend instead.
+A conservative `#define` macro-expansion pre-pass (idea C-1, see
+``macro_expand.py``) runs before parsing when ``config.parser.expand_macros`` is
+enabled (default), so call sites wrapped in simple macros resolve to the real
+callee. Function definitions emitted entirely via macros (e.g.
+``DECLARE_HANDLER(foo, int)``) are still not detected; for heavily macro-driven
+codebases consider a libclang backend instead.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional
 
 from ..config import Config
 from ..models import CallRelationship, FunctionDef, Language, Parameter, ResolutionConfidence, VariableDef
 from .base import BaseParser
+from .macro_expand import expand_c_macros
 
 try:
     import tree_sitter_c as _tsc
@@ -28,6 +33,67 @@ def _check_available() -> None:
             "tree-sitter-c is not installed.\n"
             "Run: pip install tree-sitter tree-sitter-c"
         )
+
+
+# ==============================================================================
+# CUSTOM INPUT FUNCTION TEMPLATE — EDIT HERE
+# ==============================================================================
+# Detect calls to functions that write external data into a variable.
+#
+# Pattern A — custom_input (lugasi / lugasian family):
+#   lugasi(&DEST, "SOURCE", WOW_NA)    — C++ class method or free function
+#   lugasian(&DEST, "SOURCE", WOW_LI)  — C++ class method or free function
+#   lugasi2(&DEST, "SOURCE", WOW_NA)   — C-style free function variant
+#   lugasian2(&DEST, "SOURCE", WOW_LI) — C-style free function variant
+#
+#   Arg[0] (&DEST)    — destination variable written by address (& stripped)
+#   Arg[1] ("SOURCE") — quoted source name; becomes the upstream VF source node
+#   Arg[2] (WOW_NA)   — classifier shown as a badge on the destination block
+#
+# Pattern B — connect free function (connect2 family):
+#   connect2(DEST_PTR, "path/input_name", ctx)
+#
+#   Arg[0] (DEST_PTR) — destination variable (pointer; & or * stripped)
+#   Arg[1] ("path/input_name") — path string; last segment = input source name
+#
+# Detected via field_expression (.connect) or direct call (CUSTOM_INPUT / CONNECT_FREE).
+# Both C and C++ parsers use these lists — add names in the case used in source.
+
+CUSTOM_INPUT_FUNC_NAMES: list[str] = [
+    # C++ class method form (lowercase, called as obj.lugasi(...) or bare lugasi(...))
+    "lugasi",
+    "lugasian",
+    # C-style free function form (lowercase "2" variants)
+    "lugasi2",
+    "lugasian2",
+    # Uppercase macro/legacy forms
+    "LUGASI",
+    "LUGASIAN",
+    "LUGASI2",
+    "LUGASIAN2",
+]
+CUSTOM_INPUT_ARG_DEST     = 0   # Index of destination variable argument (with &)
+CUSTOM_INPUT_ARG_SOURCE   = 1   # Index of quoted source/input name argument
+CUSTOM_INPUT_ARG_CLASSIFY = 2   # Index of source classifier/type argument
+# Extra arguments beyond index 2 are ignored.
+
+# Free-function connect pattern: connect2(dest_ptr, "path/input_name", ctx)
+CONNECT_FREE_FUNC_NAMES: list[str] = [
+    "connect2",
+    "CONNECT2",
+]
+CONNECT_FREE_ARG_DEST = 0   # Index of destination variable argument (pointer)
+CONNECT_FREE_ARG_PATH = 1   # Index of quoted path/input_name argument
+
+# Method names matched by _extract_connect_call (field_expression / dot-call form).
+# Add variants here — e.g. "Connect" for PascalCase codebases.
+CONNECT_METHOD_NAMES: list[str] = [
+    "connect",
+    "Connect",
+]
+# ==============================================================================
+# END CUSTOM INPUT FUNCTION TEMPLATE
+# ==============================================================================
 
 
 def _node_text(node, source: bytes) -> str:
@@ -409,6 +475,627 @@ def _dedup_variables(variables: list[VariableDef]) -> list[VariableDef]:
     return result
 
 
+# ------------------------------------------------------------------ #
+# Dead-variable detection (post-pass after function body is walked)   #
+# ------------------------------------------------------------------ #
+
+def _collect_identifiers_in_subtree(node, source: bytes) -> list[tuple[str, int]]:
+    """Collect all (name, line) from identifier and field_identifier nodes (iterative)."""
+    result: list[tuple[str, int]] = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type in ("identifier", "field_identifier"):
+            result.append((_node_text(n, source).strip(), n.start_point[0] + 1))
+        stack.extend(reversed(n.children))
+    return result
+
+
+def _detect_dead_variables(fn: "FunctionDef", body_node, source: bytes) -> None:
+    """
+    Post-pass: mark fn.variables as dead if only referenced at their declaration line,
+    and mark fn.parameters as dead if never referenced in the body at all.
+    Only considers function-scoped variables (local, static, dynamic, field).
+    """
+    from collections import defaultdict
+
+    all_ids = _collect_identifiers_in_subtree(body_node, source)
+
+    # name (lower) → set of lines where that identifier appears
+    name_to_lines: dict[str, set[int]] = defaultdict(set)
+    for id_name, id_line in all_ids:
+        name_to_lines[id_name.lower()].add(id_line)
+
+    # All identifier names seen anywhere in the body (for param checks)
+    all_id_names_lower: set[str] = set(name_to_lines.keys())
+
+    _TRACKED_SCOPES = {"local", "static", "dynamic", "field"}
+    # Synthetic call-site occurrence records (LUGASI dest, .Connect receiver)
+    # are not declarations and must not participate in "declared but never
+    # used" detection — otherwise a standalone LUGASI block with no other
+    # reference to its dest would be marked dead and disappear from the
+    # Variable Flow view.
+    _SYNTHETIC_SOURCE_KINDS = {"custom_input", "input_file_connect"}
+    for var in fn.variables:
+        if (var.scope or "").lower() not in _TRACKED_SCOPES:
+            continue
+        if (var.source_kind or "") in _SYNTHETIC_SOURCE_KINDS:
+            continue
+        vname = var.name.lower()
+        lines = name_to_lines.get(vname, set())
+        uses_beyond_decl = {ln for ln in lines if ln != var.line}
+        if not uses_beyond_decl:
+            var.is_dead = True
+            var.dead_reason = "declared but never used"
+
+    for param in fn.parameters:
+        if not param.name or param.name.lower() in ("self", "cls"):
+            continue
+        if param.name.lower() not in all_id_names_lower:
+            param.is_dead = True
+
+
+# ------------------------------------------------------------------ #
+# Helpers: unwrap casts / address-of from a dest-argument expression  #
+# ------------------------------------------------------------------ #
+
+# Matches a C/C++ cast prefix like `(char*)`, `(unsigned long *)`, `(MyType **)`,
+# `(uint8_t * const)`. Required: starts with identifier, contains at least one
+# `*` or `&` (pointer/ref marker — the distinguishing feature of a cast), then
+# optional trailing qualifier (`const`, `volatile`, `restrict`, more `*`/`&`).
+_CAST_RE = re.compile(
+    r"^\s*\(\s*"                      # opening paren
+    r"[A-Za-z_][\w\s:<>,]*"           # type name (allows templates / namespaces)
+    r"[*&][\w\s:<>,*&]*"              # at least one * or & somewhere inside
+    r"\)\s*"                          # closing paren
+)
+
+
+def _strip_cast_and_addr(text: str) -> str:
+    """
+    Strip C/C++ casts, wrapping parens, address-of `&` and dereference `*`
+    operators from the front of an expression, leaving the bare destination.
+    Shared by `_unwrap_dest_arg` (simple-identifier callers) and
+    `_unwrap_dest_full` (member-aware callers).
+    """
+    s = (text or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        m = _CAST_RE.match(s)
+        if m:
+            s = s[m.end():].lstrip()
+            changed = True
+            continue
+        if s.startswith("(") and s.endswith(")"):
+            depth = 0
+            balanced_outer = True
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i != len(s) - 1:
+                        balanced_outer = False
+                        break
+            if balanced_outer and depth == 0:
+                s = s[1:-1].strip()
+                changed = True
+                continue
+    s = s.lstrip("&* ").strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        balanced_outer = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    balanced_outer = False
+                    break
+        if not balanced_outer:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def _unwrap_dest_full(text: str) -> tuple[str, str]:
+    """
+    Like `_unwrap_dest_arg` but PRESERVES member chains. Returns
+    `(full_dest_expression, head_identifier)`.
+
+    The full expression is suitable for use as the tracked variable name
+    when the dest is something like `IMU.x_acc()`. The head identifier
+    is the parent object (or the bare variable name when there is no
+    member access) — useful for parent_name and as the .isidentifier()
+    validation check.
+
+    Examples (input -> (full, head)):
+        "&x"                          -> ("x",           "x")
+        "&m_Force"                    -> ("m_Force",     "m_Force")
+        "(char*)&m_Force"             -> ("m_Force",     "m_Force")
+        "&IMU.x_acc()"                -> ("IMU.x_acc",   "IMU")
+        "(char*)&IMU.x_acc()"         -> ("IMU.x_acc",   "IMU")
+        "&IMU->y_acc()"               -> ("IMU->y_acc",  "IMU")
+        "&s.field"                    -> ("s.field",     "s")
+        "&buf[i]"                     -> ("buf",         "buf")
+    """
+    s = _strip_cast_and_addr(text)
+    # Drop trailing method-call parens like `()` (and accidental whitespace before them)
+    while s.endswith(")"):
+        # If the dest ends with `()` (empty parens after a member), strip them.
+        # Be conservative: only strip empty `()`, never something like `f(x)`.
+        # That keeps a non-method-call form like `f(x)` intact (which isn't a
+        # valid LUGASI dest anyway and will be caught by the head .isidentifier()
+        # check below).
+        idx_open = s.rfind("(")
+        if idx_open == -1:
+            break
+        inside = s[idx_open + 1 : -1].strip()
+        if inside != "":
+            break
+        s = s[:idx_open].rstrip()
+    # Drop trailing array index `[...]`
+    if s.endswith("]"):
+        idx_open = s.rfind("[")
+        if idx_open != -1:
+            s = s[:idx_open].rstrip()
+    full = s
+    # Head identifier = the first segment before any member separator or index
+    head = full.split("->")[0].split(".")[0].split("[")[0].strip()
+    return full, head
+
+
+def _unwrap_dest_arg(text: str) -> str:
+    """
+    Strip C/C++ casts, wrapping parens, address-of and dereference operators
+    from the destination-argument text of a LUGASI / connect2-style call.
+    Returns ONLY the head identifier — for member-aware callers that need
+    to preserve the full member expression, use `_unwrap_dest_full`.
+
+    Examples (input -> output):
+        "&x"                     -> "x"
+        "&m_Force"               -> "m_Force"
+        "(char*)&m_Force"        -> "m_Force"
+        "(unsigned long *)&v"    -> "v"
+        "((char*)&m_Force)"      -> "m_Force"
+        "(some_type **) & x"     -> "x"
+        "&s.field"               -> "s"     (parent of member access)
+    """
+    _full, head = _unwrap_dest_full(text)
+    return head
+
+
+# ------------------------------------------------------------------ #
+# .connect("PATH/input_var", ...) pattern detection                   #
+# ------------------------------------------------------------------ #
+
+def _extract_connect_call(
+    call_node,
+    source: bytes,
+    file_path: str,
+    current_func: "FunctionDef",
+) -> Optional[VariableDef]:
+    """
+    Detect: variable.connect("PATH/input_var_name", ...) calls.
+    Returns a VariableDef representing the local variable bound to the input source,
+    or None if this call does not match the pattern.
+    """
+    # Must be a field_expression call (.method syntax)
+    func_part = None
+    for child in call_node.children:
+        if child.type == "field_expression":
+            func_part = child
+            break
+    if func_part is None:
+        return None
+
+    field_id = _find_child_by_type(func_part, "field_identifier")
+    if field_id is None or _node_text(field_id, source).strip() not in CONNECT_METHOD_NAMES:
+        return None
+
+    # Receiver is the expression before .connect / ->connect. Tree-sitter's
+    # field_expression exposes it via the 'argument' named field; fall back to
+    # the first named child that isn't the field_identifier for older grammars.
+    # Supported receiver shapes (raw text -> stored name):
+    #   var.connect(...)              -> "var"
+    #   module.signal.connect(...)    -> "module.signal"
+    #   this->sensor.connect(...)     -> "this->sensor"
+    #   obj->field.connect(...)       -> "obj->field"
+    #   IMU.x_acc().connect(...)      -> "IMU.x_acc"
+    # _unwrap_dest_full strips casts / & / trailing () / [] using the same
+    # normalization the LUGASI extractor applies to member-chain dests, so a
+    # .connect block on `IMU.x_acc` keys the same VAR_FLOW_DATA record as a
+    # LUGASI dest on `IMU.x_acc`.
+    receiver_node = None
+    try:
+        receiver_node = func_part.child_by_field_name("argument")
+    except Exception:
+        receiver_node = None
+    if receiver_node is None:
+        for ch in func_part.children:
+            if ch.is_named and ch is not field_id:
+                receiver_node = ch
+                break
+    if receiver_node is None:
+        return None
+    receiver, _head = _unwrap_dest_full(_node_text(receiver_node, source))
+    if not receiver:
+        return None
+
+    # First argument must be a string literal
+    arg_list = _find_child_by_type(call_node, "argument_list")
+    if arg_list is None:
+        return None
+    first_arg = None
+    for child in arg_list.children:
+        if child.type not in (",", "(", ")") and child.is_named:
+            first_arg = child
+            break
+    if first_arg is None or first_arg.type not in ("string_literal", "concatenated_string"):
+        return None
+
+    path_raw = _node_text(first_arg, source).strip()
+    # Strip surrounding quotes
+    path_str = path_raw
+    if path_str.startswith('"') and path_str.endswith('"'):
+        path_str = path_str[1:-1]
+    elif path_str.startswith("'") and path_str.endswith("'"):
+        path_str = path_str[1:-1]
+    if not path_str:
+        return None
+
+    input_name = path_str.split("/")[-1] if "/" in path_str else path_str
+
+    return VariableDef(
+        name=receiver,
+        scope="local",
+        line=call_node.start_point[0] + 1,
+        file_path=file_path,
+        context=current_func.qualified_name,
+        source_kind="input_file_connect",
+        source_detail=path_str,
+        connect_path=path_str,
+        connect_input_name=input_name,
+        value=_node_text(call_node, source).strip()[:120],
+    )
+
+
+# ------------------------------------------------------------------ #
+# Free-function connect pattern (connect2 family)                     #
+# connect2(dest_ptr, "path/input_name", ctx)                         #
+# ------------------------------------------------------------------ #
+
+def _extract_connect_free_func_call(
+    call_node,
+    source: bytes,
+    file_path: str,
+    current_func: "FunctionDef",
+) -> Optional[VariableDef]:
+    """
+    Detect: connect2(dest_ptr, "path/input_name", ...) direct-call pattern.
+    The destination variable is the first argument (pointer; & and * stripped).
+    The path string is the second argument; the last path segment is the input name.
+    Returns a VariableDef with source_kind='input_file_connect' and custom_input_func
+    set to the matched function name so the badge displays correctly.
+    """
+    func_name = _extract_call_name(call_node, source)
+    if not func_name or func_name not in CONNECT_FREE_FUNC_NAMES:
+        return None
+
+    arg_list = _find_child_by_type(call_node, "argument_list")
+    if arg_list is None:
+        return None
+
+    args = [
+        child for child in arg_list.children
+        if child.type not in (",", "(", ")") and child.is_named
+    ]
+
+    max_needed = max(CONNECT_FREE_ARG_DEST, CONNECT_FREE_ARG_PATH)
+    if len(args) <= max_needed:
+        return None
+
+    # --- Destination variable (preserve member chain; strip casts/parens/&) ---
+    dest_node = args[CONNECT_FREE_ARG_DEST]
+    dest_txt = _node_text(dest_node, source).strip()
+    dest_full, dest_head = _unwrap_dest_full(dest_txt)
+    if not dest_head.isidentifier():
+        return None
+    dest_name = dest_full
+    dest_parent = dest_head if dest_full != dest_head else None
+
+    # --- Path string (second arg must be a string literal) ---
+    path_node = args[CONNECT_FREE_ARG_PATH]
+    path_raw = _node_text(path_node, source).strip()
+    if path_node.type not in ("string_literal", "concatenated_string"):
+        return None
+    path_str = path_raw
+    if path_str.startswith('"') and path_str.endswith('"'):
+        path_str = path_str[1:-1]
+    elif path_str.startswith("'") and path_str.endswith("'"):
+        path_str = path_str[1:-1]
+    if not path_str:
+        return None
+
+    input_name = path_str.split("/")[-1] if "/" in path_str else path_str
+
+    return VariableDef(
+        name=dest_name,
+        scope="local",
+        line=call_node.start_point[0] + 1,
+        file_path=file_path,
+        context=current_func.qualified_name,
+        source_kind="input_file_connect",
+        source_detail=path_str,
+        connect_path=path_str,
+        connect_input_name=input_name,
+        custom_input_func=func_name,
+        parent_name=dest_parent,
+        value=_node_text(call_node, source).strip()[:120],
+    )
+
+
+# ------------------------------------------------------------------ #
+# Custom input function detection (LUGASI / LUGASIAN template)       #
+# ------------------------------------------------------------------ #
+
+def _extract_custom_input_call(
+    call_node,
+    source: bytes,
+    file_path: str,
+    current_func: "FunctionDef",
+) -> Optional[VariableDef]:
+    """
+    Detect calls matching the custom input function template:
+        LUGASI(&YALLA,   "BALLA", WOW_NA, ...optional_extra_args...)
+        LUGASI(&YALLA,   "BALLA", WOW_LI, ...optional_extra_args...)
+        LUGASIAN(&YALLA, "BALLA", WOW_NA, ...optional_extra_args...)
+        LUGASIAN(&YALLA, "BALLA", WOW_LI, ...optional_extra_args...)
+
+    Returns a VariableDef for the destination variable YALLA with the source
+    name "BALLA" stored in connect_input_name (so Variable Flow Mode can
+    render it as an upstream source node), or None if no match.
+
+    Edit CUSTOM_INPUT_FUNC_NAMES / CUSTOM_INPUT_ARG_* above to configure.
+    """
+    func_name = _extract_call_name(call_node, source)
+    if not func_name or func_name not in CUSTOM_INPUT_FUNC_NAMES:
+        return None
+
+    arg_list = _find_child_by_type(call_node, "argument_list")
+    if arg_list is None:
+        return None
+
+    args = [
+        child for child in arg_list.children
+        if child.type not in (",", "(", ")") and child.is_named
+    ]
+
+    # Need at least dest + source_name + classifier
+    max_needed = max(CUSTOM_INPUT_ARG_DEST, CUSTOM_INPUT_ARG_SOURCE, CUSTOM_INPUT_ARG_CLASSIFY)
+    if len(args) <= max_needed:
+        return None
+
+    # --- Destination variable (preserve member chain; strip casts/parens/&) ---
+    dest_node = args[CUSTOM_INPUT_ARG_DEST]
+    dest_txt = _node_text(dest_node, source).strip()
+    dest_full, dest_head = _unwrap_dest_full(dest_txt)
+    # Validation is on the HEAD identifier (the parent var must be a valid name).
+    # `dest_full` may be a member chain like "IMU.x_acc" — that's fine and is
+    # what we want to expose as the tracked variable name.
+    if not dest_head.isidentifier():
+        return None
+    dest_name = dest_full
+    # Only set parent_name when the dest is actually a member access.
+    dest_parent = dest_head if dest_full != dest_head else None
+
+    # --- Quoted source/input name ---
+    src_node = args[CUSTOM_INPUT_ARG_SOURCE]
+    src_raw = _node_text(src_node, source).strip()
+    if src_node.type not in ("string_literal", "concatenated_string"):
+        return None
+    src_name = src_raw
+    if src_name.startswith('"') and src_name.endswith('"'):
+        src_name = src_name[1:-1]
+    elif src_name.startswith("'") and src_name.endswith("'"):
+        src_name = src_name[1:-1]
+    if not src_name:
+        return None
+
+    # --- Classifier/type (third arg, raw text) ---
+    cls_node = args[CUSTOM_INPUT_ARG_CLASSIFY]
+    classifier = _node_text(cls_node, source).strip()
+
+    call_text = _node_text(call_node, source).strip()[:120]
+
+    return VariableDef(
+        name=dest_name,
+        scope="local",
+        line=call_node.start_point[0] + 1,
+        file_path=file_path,
+        context=current_func.qualified_name,
+        source_kind="custom_input",
+        source_detail=f"{func_name}(\"{src_name}\", {classifier})",
+        connect_input_name=src_name,
+        connect_path=src_name,
+        custom_input_func=func_name,
+        custom_input_classifier=classifier,
+        parent_name=dest_parent,
+        value=call_text,
+    )
+
+
+# ------------------------------------------------------------------ #
+# Member access tracking — var.x / var.x() / var->x                   #
+# ------------------------------------------------------------------ #
+
+# Identifiers we never want to emit as a tracked member (operator overloads,
+# common stdlib method names that would swamp the data without insight).
+_MEMBER_SKIP_NAMES: frozenset[str] = frozenset({
+    "operator", "operator=", "operator()", "operator[]", "operator->",
+})
+
+
+def _extract_member_access(
+    field_expr,
+    source: bytes,
+    file_path: str,
+    current_func: "FunctionDef",
+) -> Optional[VariableDef]:
+    """
+    Detect a `var.x` / `var->x` access (whether part of a call like `var.x()`
+    or a bare read like `printf("%d", var.x)`) and return a VariableDef whose
+    `name` is the member identifier `x` and whose `parent_name` is the parent
+    expression `var`. Returns None for cases that should not be tracked
+    (namespace-qualified `std::endl`, operator overloads, unparseable parent).
+
+    The caller is responsible for dedup-by (function_id, line, member_name).
+    """
+    if field_expr is None or field_expr.type != "field_expression":
+        return None
+    field_id = _find_child_by_type(field_expr, "field_identifier")
+    if field_id is None:
+        return None
+    member_name = _node_text(field_id, source).strip()
+    if not member_name or not member_name.isidentifier():
+        return None
+    if member_name in _MEMBER_SKIP_NAMES:
+        return None
+
+    # Parent expression = the field_expression text minus ".<member>" / "-><member>"
+    full_text = _node_text(field_expr, source).strip()
+    # Strip the member suffix off the end (handles both `.x` and `->x`)
+    parent_text = full_text
+    for sep in (f"->{member_name}", f".{member_name}"):
+        if parent_text.endswith(sep):
+            parent_text = parent_text[: -len(sep)]
+            break
+    parent_text = parent_text.strip()
+    if not parent_text:
+        return None
+
+    # If the next non-whitespace byte after the field_expression is '(', this
+    # is a method call (`var.x()`); show the parens to make the form obvious.
+    # Source-text peek is robust across tree-sitter Python binding variations
+    # in how `.parent` is exposed on freshly-walked nodes.
+    is_call = False
+    end = field_expr.end_byte
+    while end < len(source) and source[end:end+1] in (b" ", b"\t", b"\r", b"\n"):
+        end += 1
+    if end < len(source) and source[end:end+1] == b"(":
+        is_call = True
+    access_expr = f"{full_text}()" if is_call else full_text
+
+    return VariableDef(
+        name=member_name,
+        scope="member",
+        line=field_expr.start_point[0] + 1,
+        file_path=file_path,
+        context=current_func.qualified_name,
+        source_kind="member_access",
+        source_detail=access_expr[:120],
+        parent_name=parent_text[:80],
+        value=access_expr[:80],
+    )
+
+
+# ------------------------------------------------------------------ #
+# memset / memcpy variable-flow tracking                              #
+# ------------------------------------------------------------------ #
+
+def _extract_memory_op(
+    call_node,
+    source: bytes,
+    file_path: str,
+    current_func: "FunctionDef",
+) -> list[VariableDef]:
+    """
+    Detect memset/memcpy/memmove calls and create VariableDef entries
+    representing the memory operation targets and sources.
+    """
+    name = _extract_call_name(call_node, source)
+    if name not in ("memset", "memcpy", "memmove", "mempcpy", "wmemset", "wmemcpy"):
+        return []
+
+    arg_list = _find_child_by_type(call_node, "argument_list")
+    if arg_list is None:
+        return []
+
+    args = [
+        child for child in arg_list.children
+        if child.type not in (",", "(", ")") and child.is_named
+    ]
+
+    line = call_node.start_point[0] + 1
+    context = current_func.qualified_name
+    call_text = _node_text(call_node, source).strip()[:120]
+
+    def _base_name(expr_node) -> Optional[str]:
+        """Strip deref/address-of/cast/array-index to get simple identifier."""
+        txt = _node_text(expr_node, source).strip()
+        # Handle pointer member: buf->field or obj.field — take root object
+        txt = txt.split("->")[0].split(".")[0]
+        txt = txt.lstrip("&*")
+        txt = txt.split("[")[0].strip()
+        # Strip C cast: (Type)expr
+        if txt.startswith("("):
+            close = txt.find(")")
+            if close != -1:
+                txt = txt[close + 1:].lstrip("&* ")
+        if txt.isidentifier():
+            return txt
+        return None
+
+    results: list[VariableDef] = []
+
+    if name == "memset" and args:
+        dest = _base_name(args[0])
+        if dest:
+            results.append(VariableDef(
+                name=dest,
+                scope="local",
+                line=line,
+                file_path=file_path,
+                context=context,
+                source_kind="memory initialization",
+                source_detail=f"memset",
+                value=call_text,
+            ))
+
+    elif name in ("memcpy", "memmove", "mempcpy", "wmemcpy") and len(args) >= 2:
+        dest = _base_name(args[0])
+        src  = _base_name(args[1])
+        src_txt = _node_text(args[1], source).strip()[:60]
+
+        if dest:
+            results.append(VariableDef(
+                name=dest,
+                scope="local",
+                line=line,
+                file_path=file_path,
+                context=context,
+                source_kind="memory copy",
+                source_detail=f"memcpy from {src_txt}",
+                value=call_text,
+            ))
+        if src:
+            dest_txt = _node_text(args[0], source).strip()[:60]
+            results.append(VariableDef(
+                name=src,
+                scope="local",
+                line=line,
+                file_path=file_path,
+                context=context,
+                source_kind="memory copy source",
+                source_detail=f"memcpy to {dest_txt}",
+                value=call_text,
+            ))
+
+    return results
+
+
 def _extract_function_name(declarator_node, source: bytes) -> Optional[str]:
     """
     Recursively unwrap a C declarator to find the function name.
@@ -504,6 +1191,93 @@ def _extract_call_args(call_node, source: bytes) -> list[str]:
 
 
 # These are re-exported for cpp_parser to import
+def _extract_declarator_ident(node, source: bytes) -> Optional[str]:
+    """Find the innermost ``identifier`` name from any declarator subtree.
+
+    Works for ``pointer_declarator``, ``parenthesized_declarator``,
+    ``function_declarator``, ``reference_declarator``, ``array_declarator``, etc.
+    Returns the bare variable name, not the full declarator text.
+    """
+    if node.type in ("identifier", "field_identifier"):
+        return _node_text(node, source).strip()
+    for child in node.children:
+        if child.is_named:
+            result = _extract_declarator_ident(child, source)
+            if result:
+                return result
+    return None
+
+
+def _collect_fp_assignments(body_node, source: bytes) -> dict[str, list[str]]:
+    """Walk a function body and collect function-pointer variable assignments.
+
+    Returns ``{var_name: [assigned_function_names]}`` for patterns like::
+
+        void (*fp)(void) = target;      # init_declarator
+        fp = target;                     # assignment_expression, both identifiers
+        s.callback = target;             # assignment via field_expression
+
+    Stops descent at nested ``function_definition`` nodes (lambdas / nested fns).
+    This drives idea C-2 (pointer-target resolution).
+    """
+    result: dict[str, list[str]] = {}
+
+    stack = [body_node]
+    while stack:
+        node = stack.pop()
+
+        if node.type == "init_declarator":
+            # Locate the '=' sign between declarator and value.
+            eq_idx = next(
+                (i for i, c in enumerate(node.children) if _node_text(c, source) == "="),
+                -1,
+            )
+            if eq_idx != -1:
+                decl_side = node.children[:eq_idx]
+                val_side = node.children[eq_idx + 1:]
+                var_name: Optional[str] = None
+                for c in decl_side:
+                    if c.is_named:
+                        var_name = _extract_declarator_ident(c, source)
+                        if var_name:
+                            break
+                for c in val_side:
+                    if c.is_named and c.type == "identifier":
+                        target = _node_text(c, source).strip()
+                        if var_name and target and var_name != target:
+                            result.setdefault(var_name, [])
+                            if target not in result[var_name]:
+                                result[var_name].append(target)
+                        break
+
+        elif node.type == "assignment_expression":
+            named = [c for c in node.children if c.is_named]
+            if len(named) >= 2:
+                lhs, rhs = named[0], named[-1]
+                if rhs.type == "identifier":
+                    target = _node_text(rhs, source).strip()
+                    if lhs.type == "identifier":
+                        var = _node_text(lhs, source).strip()
+                        if var and target and var != target:
+                            result.setdefault(var, [])
+                            if target not in result[var]:
+                                result[var].append(target)
+                    elif lhs.type == "field_expression":
+                        field_id = _find_child_by_type(lhs, "field_identifier")
+                        if field_id:
+                            field_name = _node_text(field_id, source).strip()
+                            if field_name and target and field_name != target:
+                                result.setdefault(field_name, [])
+                                if target not in result[field_name]:
+                                    result[field_name].append(target)
+
+        for child in node.children:
+            if child.type != "function_definition":
+                stack.append(child)
+
+    return result
+
+
 def get_language(lang_name: str) -> TSLanguage:
     if lang_name == "c":
         import tree_sitter_c as _tsc
@@ -519,19 +1293,49 @@ def ts_get_parser(lang_name: str) -> TSParser:
     return TSParser(lang)
 
 
+def _maybe_expand_macros(source_bytes: bytes, config: Config) -> bytes:
+    """Run the simple #define macro-expansion pre-pass (idea C-1) when enabled.
+
+    Decodes with latin-1 (lossless 1:1 byte mapping) so the expander operates on
+    text, then re-encodes. Line count is preserved by the expander, keeping all
+    downstream line numbers / node ids stable. Any failure degrades gracefully to
+    the original bytes — parsing must never hard-crash.
+    """
+    if not getattr(getattr(config, "parser", None), "expand_macros", True):
+        return source_bytes
+    try:
+        text = source_bytes.decode("latin-1")
+        expanded = expand_c_macros(text)
+        if expanded is text:
+            return source_bytes
+        return expanded.encode("latin-1")
+    except Exception:
+        return source_bytes
+
+
 class CParser(BaseParser):
     LANGUAGE_NAME = "c"
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         _check_available()
-        self._ts_parser = ts_get_parser(self.LANGUAGE_NAME)
+        # Tree-sitter Parser is not thread-safe — give each worker thread its own.
+        import threading
+        self._tls = threading.local()
+
+    def _get_parser(self) -> "TSParser":
+        p = getattr(self._tls, "parser", None)
+        if p is None:
+            p = ts_get_parser(self.LANGUAGE_NAME)
+            self._tls.parser = p
+        return p
 
     def parse_file(
         self, path: Path
     ) -> tuple[list[FunctionDef], list[CallRelationship]]:
         source_bytes = path.read_bytes()
-        tree = self._ts_parser.parse(source_bytes)
+        source_bytes = _maybe_expand_macros(source_bytes, self.config)
+        tree = self._get_parser().parse(source_bytes)
 
         functions: list[FunctionDef] = []
         calls: list[CallRelationship] = []
@@ -595,22 +1399,72 @@ class CParser(BaseParser):
                 functions.append(fn)
                 body = _find_child_by_type(node, "compound_statement")
                 if body:
+                    fn._fp_targets = _collect_fp_assignments(body, source)  # type: ignore[attr-defined]
                     self._walk(body, source, file_path, functions, calls,
                                current_func=fn, namespace_stack=namespace_stack,
                                file_variables=file_variables)
+                    _detect_dead_variables(fn, body, source)
                 return
 
         elif node.type == "call_expression" and current_func:
             name = _extract_call_name(node, source)
             if name:
-                calls.append(CallRelationship(
-                    caller_id=current_func.node_id,
-                    callee_name=name,
-                    call_file=file_path,
-                    call_line=node.start_point[0] + 1,
-                    call_args=_extract_call_args(node, source),
-                    resolution_confidence=ResolutionConfidence.UNRESOLVED,
-                ))
+                fp_targets = getattr(current_func, "_fp_targets", {})
+                if name in fp_targets:
+                    # Emit one call per known pointer target (idea C-2)
+                    for target in fp_targets[name]:
+                        calls.append(CallRelationship(
+                            caller_id=current_func.node_id,
+                            callee_name=target,
+                            call_file=file_path,
+                            call_line=node.start_point[0] + 1,
+                            call_args=_extract_call_args(node, source),
+                            resolution_confidence=ResolutionConfidence.HEURISTIC,
+                            resolution_hint=f"function-pointer target (via {name})",
+                        ))
+                else:
+                    calls.append(CallRelationship(
+                        caller_id=current_func.node_id,
+                        callee_name=name,
+                        call_file=file_path,
+                        call_line=node.start_point[0] + 1,
+                        call_args=_extract_call_args(node, source),
+                        resolution_confidence=ResolutionConfidence.UNRESOLVED,
+                    ))
+            # .connect("PATH/input_var", ...) pattern — method-call form
+            conn_var = _extract_connect_call(node, source, file_path, current_func)
+            if conn_var:
+                current_func.variables.append(conn_var)
+            # connect2(...) — free-function form of .connect
+            conn_free_var = _extract_connect_free_func_call(node, source, file_path, current_func)
+            if conn_free_var:
+                current_func.variables.append(conn_free_var)
+            # lugasi / lugasian (and 2-variants) custom input function template
+            custom_var = _extract_custom_input_call(node, source, file_path, current_func)
+            if custom_var:
+                current_func.variables.append(custom_var)
+            # memset / memcpy tracking
+            mem_vars = _extract_memory_op(node, source, file_path, current_func)
+            current_func.variables.extend(mem_vars)
+
+        # Member-access tracking (var.x / var.x() / var->x). Fires for every
+        # field_expression inside a function body. We dedup by (line, member)
+        # via an ad-hoc set attached to the FunctionDef so the same source
+        # location doesn't yield multiple identical entries.
+        if node.type == "field_expression" and current_func:
+            seen = getattr(current_func, "_member_access_seen", None)
+            if seen is None:
+                seen = set()
+                current_func._member_access_seen = seen   # type: ignore[attr-defined]
+            field_id = _find_child_by_type(node, "field_identifier")
+            if field_id is not None:
+                m_name = _node_text(field_id, source).strip()
+                key = (node.start_point[0] + 1, m_name)
+                if m_name and key not in seen:
+                    seen.add(key)
+                    mv = _extract_member_access(node, source, file_path, current_func)
+                    if mv:
+                        current_func.variables.append(mv)
 
         for child in node.children:
             self._walk(child, source, file_path, functions, calls,

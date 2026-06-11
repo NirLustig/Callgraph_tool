@@ -91,6 +91,16 @@ class SlnSummary:
     project_count: int = 0
     file_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    # Per-project absolute file paths, used by BuildInfo / architecture inference.
+    project_files: dict[str, list[Path]] = field(default_factory=dict)
+    # Solution-level configurations and platforms (deduplicated, in original order).
+    configurations: list[str] = field(default_factory=list)
+    platforms: list[str] = field(default_factory=list)
+    # Solution-level merged include paths and defines (best-effort).
+    include_paths: list[str] = field(default_factory=list)
+    defines: list[str] = field(default_factory=list)
+    # Per-project metadata for the GUI / build_info layer.
+    project_metadata: list[dict] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------ #
@@ -250,14 +260,27 @@ def discover_from_sln(sln_path: Path, cfg: Config) -> SlnSummary:
     summary.warnings.extend(sln_warnings)
     summary.project_count = len(projects)
 
+    # Solution-level configurations + platforms (best-effort regex on the .sln text).
+    summary.configurations, summary.platforms = _read_sln_configs_platforms(sln_path)
+
     seen: set[Path] = set()
+    config_filter = (cfg.build.configuration or "").strip().lower() if cfg else ""
+    platform_filter = (cfg.build.platform or "").strip().lower() if cfg else ""
+
+    project_filter = []
+    if cfg and cfg.selection and cfg.selection.projects:
+        project_filter = [p.lower() for p in cfg.selection.projects if p]
 
     for proj in projects:
+        if project_filter and not any(p in proj.name.lower() for p in project_filter):
+            continue
+
         source_files, proj_warnings = read_vcxproj(proj.path)
         summary.warnings.extend(
             f"[{proj.name}] {w}" for w in proj_warnings
         )
 
+        proj_files_kept: list[Path] = []
         for f in source_files:
             if f in seen:
                 continue
@@ -276,9 +299,118 @@ def discover_from_sln(sln_path: Path, cfg: Config) -> SlnSummary:
                 lang = infer_header_language(f)
 
             summary.files[lang].append(f)
+            proj_files_kept.append(f)
 
+        summary.project_files[proj.name] = proj_files_kept
+
+        # Per-project include paths / defines from PropertyGroup.
+        try:
+            includes, defines = _read_vcxproj_metadata(
+                proj.path, config_filter, platform_filter
+            )
+        except Exception as exc:
+            includes, defines = [], []
+            summary.warnings.append(
+                f"[{proj.name}] metadata read failed: {exc}"
+            )
+        summary.include_paths.extend(includes)
+        summary.defines.extend(defines)
+        summary.project_metadata.append({
+            "name": proj.name,
+            "path": str(proj.path),
+            "include_paths": includes,
+            "defines": defines,
+            "files": [str(f) for f in proj_files_kept],
+        })
+
+    # Deduplicate while preserving order.
+    summary.include_paths = list(dict.fromkeys(summary.include_paths))
+    summary.defines = list(dict.fromkeys(summary.defines))
     summary.file_count = sum(len(v) for v in summary.files.values())
     return summary
+
+
+# ------------------------------------------------------------------ #
+# Solution configurations + platforms                                 #
+# ------------------------------------------------------------------ #
+
+_SLN_GLOBAL_CFG_LINE = re.compile(
+    r'^\s*([^|=]+?)\|([^=]+?)\s*=\s*\1\|\2\s*$', re.MULTILINE
+)
+
+
+def _read_sln_configs_platforms(sln_path: Path) -> tuple[list[str], list[str]]:
+    """Return (configurations, platforms) found in the .sln SolutionConfigurationPlatforms section."""
+    try:
+        content = sln_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return [], []
+    in_section = False
+    configs: list[str] = []
+    platforms: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GlobalSection(SolutionConfigurationPlatforms)"):
+            in_section = True
+            continue
+        if in_section and stripped.startswith("EndGlobalSection"):
+            break
+        if in_section:
+            m = _SLN_GLOBAL_CFG_LINE.match(line)
+            if m:
+                cfg_name = m.group(1).strip()
+                plat_name = m.group(2).strip()
+                if cfg_name and cfg_name not in configs:
+                    configs.append(cfg_name)
+                if plat_name and plat_name not in platforms:
+                    platforms.append(plat_name)
+    return configs, platforms
+
+
+# ------------------------------------------------------------------ #
+# .vcxproj include paths / defines (PropertyGroup, best-effort)       #
+# ------------------------------------------------------------------ #
+
+def _read_vcxproj_metadata(
+    vcxproj_path: Path,
+    config_filter: str,
+    platform_filter: str,
+) -> tuple[list[str], list[str]]:
+    """Return (include_paths, defines) merged across matching ItemDefinitionGroups."""
+    try:
+        tree = ET.parse(str(vcxproj_path))
+    except (ET.ParseError, OSError):
+        return [], []
+    root = tree.getroot()
+
+    includes: list[str] = []
+    defines: list[str] = []
+
+    for idg in root.iter():
+        tag = _NS_RE.sub("", idg.tag).lower()
+        if tag != "itemdefinitiongroup":
+            continue
+        condition = idg.get("Condition", "") or ""
+        if config_filter and config_filter not in condition.lower() and condition:
+            continue
+        if platform_filter and platform_filter not in condition.lower() and condition:
+            continue
+        for child in idg.iter():
+            ctag = _NS_RE.sub("", child.tag).lower()
+            text = (child.text or "").strip()
+            if not text:
+                continue
+            if ctag == "additionalincludedirectories":
+                for tok in text.split(";"):
+                    tok = tok.strip()
+                    if tok and not tok.startswith("%"):
+                        includes.append(tok.replace("\\", "/"))
+            elif ctag == "preprocessordefinitions":
+                for tok in text.split(";"):
+                    tok = tok.strip()
+                    if tok and not tok.startswith("%"):
+                        defines.append(tok)
+    return includes, defines
 
 
 # ------------------------------------------------------------------ #

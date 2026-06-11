@@ -17,14 +17,23 @@ from ..models import CallRelationship, FunctionDef, Language, Parameter, Resolut
 from .base import BaseParser
 from .c_parser import (
     _check_available,
+    _collect_fp_assignments,
     _dedup_variables,
+    _detect_dead_variables,
     _extract_assignment_variable,
     _extract_call_args,
+    _extract_connect_call,
+    _extract_declarator_ident,
+    _extract_member_access,
+    _extract_connect_free_func_call,
+    _extract_custom_input_call,
+    _extract_memory_op,
     _extract_parameters,
     _extract_preproc_constant,
     _extract_variables_from_declaration,
     _find_child_by_type,
     _find_children_by_type,
+    _maybe_expand_macros,
     _node_text,
     ts_get_parser,
     get_language,
@@ -41,7 +50,8 @@ def _extract_qualified_name(node, source: bytes) -> Optional[str]:
                 if text.strip():
                     parts.append(text)
         return "::".join(parts)
-    if node.type == "identifier":
+    # field_identifier is used for inline class method names inside field_declaration_list
+    if node.type in ("identifier", "field_identifier"):
         return _node_text(node, source)
     if node.type == "destructor_name":
         return _node_text(node, source)
@@ -90,13 +100,23 @@ class CppParser(BaseParser):
         super().__init__(config)
         _check_available()
         self._ts_lang = get_language(self.LANGUAGE_NAME)
-        self._ts_parser = ts_get_parser(self.LANGUAGE_NAME)
+        # Tree-sitter Parser is not thread-safe — give each worker thread its own.
+        import threading
+        self._tls = threading.local()
+
+    def _get_parser(self):
+        p = getattr(self._tls, "parser", None)
+        if p is None:
+            p = ts_get_parser(self.LANGUAGE_NAME)
+            self._tls.parser = p
+        return p
 
     def parse_file(
         self, path: Path
     ) -> tuple[list[FunctionDef], list[CallRelationship]]:
         source_bytes = path.read_bytes()
-        tree = self._ts_parser.parse(source_bytes)
+        source_bytes = _maybe_expand_macros(source_bytes, self.config)
+        tree = self._get_parser().parse(source_bytes)
 
         functions: list[FunctionDef] = []
         calls: list[CallRelationship] = []
@@ -194,22 +214,69 @@ class CppParser(BaseParser):
                 functions.append(fn)
                 body = _find_child_by_type(node, "compound_statement")
                 if body:
+                    fn._fp_targets = _collect_fp_assignments(body, source)  # type: ignore[attr-defined]
                     self._walk(body, source, file_path, functions, calls,
                                fn, class_stack, namespace_stack,
                                file_variables)
+                    _detect_dead_variables(fn, body, source)
             return
 
         if node_type == "call_expression" and current_func:
             name = _extract_cpp_call_name(node, source)
             if name:
-                calls.append(CallRelationship(
-                    caller_id=current_func.node_id,
-                    callee_name=name,
-                    call_file=file_path,
-                    call_line=node.start_point[0] + 1,
-                    call_args=_extract_call_args(node, source),
-                    resolution_confidence=ResolutionConfidence.UNRESOLVED,
-                ))
+                fp_targets = getattr(current_func, "_fp_targets", {})
+                if name in fp_targets:
+                    for target in fp_targets[name]:
+                        calls.append(CallRelationship(
+                            caller_id=current_func.node_id,
+                            callee_name=target,
+                            call_file=file_path,
+                            call_line=node.start_point[0] + 1,
+                            call_args=_extract_call_args(node, source),
+                            resolution_confidence=ResolutionConfidence.HEURISTIC,
+                            resolution_hint=f"function-pointer target (via {name})",
+                        ))
+                else:
+                    calls.append(CallRelationship(
+                        caller_id=current_func.node_id,
+                        callee_name=name,
+                        call_file=file_path,
+                        call_line=node.start_point[0] + 1,
+                        call_args=_extract_call_args(node, source),
+                        resolution_confidence=ResolutionConfidence.UNRESOLVED,
+                    ))
+            # .connect("PATH/input_var", ...) pattern — method-call form
+            conn_var = _extract_connect_call(node, source, file_path, current_func)
+            if conn_var:
+                current_func.variables.append(conn_var)
+            # connect2(...) — free-function form of .connect
+            conn_free_var = _extract_connect_free_func_call(node, source, file_path, current_func)
+            if conn_free_var:
+                current_func.variables.append(conn_free_var)
+            # lugasi / lugasian (and 2-variants) custom input function template
+            custom_var = _extract_custom_input_call(node, source, file_path, current_func)
+            if custom_var:
+                current_func.variables.append(custom_var)
+            # memset / memcpy tracking
+            mem_vars = _extract_memory_op(node, source, file_path, current_func)
+            current_func.variables.extend(mem_vars)
+
+        # Member-access tracking (mirrors CParser._walk; see c_parser.py for the
+        # dedup rationale).
+        if node.type == "field_expression" and current_func:
+            seen = getattr(current_func, "_member_access_seen", None)
+            if seen is None:
+                seen = set()
+                current_func._member_access_seen = seen   # type: ignore[attr-defined]
+            field_id = _find_child_by_type(node, "field_identifier")
+            if field_id is not None:
+                m_name = _node_text(field_id, source).strip()
+                key = (node.start_point[0] + 1, m_name)
+                if m_name and key not in seen:
+                    seen.add(key)
+                    mv = _extract_member_access(node, source, file_path, current_func)
+                    if mv:
+                        current_func.variables.append(mv)
 
         for child in node.children:
             self._walk(child, source, file_path, functions, calls,

@@ -7,9 +7,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
+
+
+_VALID_RENDER_LEVELS = ("function", "script", "folder", "module", "library", "namespace")
 
 
 @dataclass
@@ -51,6 +54,56 @@ class OutputConfig:
     layout: str = "force"             # "force" (free drag) | "hierarchical"
     max_nodes: int = 3000
     node_size_scale: float = 1.0
+    parallel: Optional[int] = None    # parser worker threads; None = auto-detect
+    summary_by_file: bool = False     # collapse 1-node-per-function to 1-node-per-file
+
+
+@dataclass
+class BuildConfig:
+    """compile_commands.json + .sln configuration metadata."""
+    compile_commands: Optional[str] = None     # explicit path; if None, auto-detect
+    auto_detect: bool = True                   # search common locations when path is empty
+    configuration: Optional[str] = None        # active .sln configuration (Debug / Release)
+    platform: Optional[str] = None             # active .sln platform (x64 / Win32)
+
+
+@dataclass
+class SelectionConfig:
+    """Restrict analysis to a subset of the project (used by GUI .sln picker + CLI flags)."""
+    projects: list[str] = field(default_factory=list)   # .vcxproj names (substring)
+    modules:  list[str] = field(default_factory=list)
+    folders:  list[str] = field(default_factory=list)   # glob patterns relative to root
+    files:    list[str] = field(default_factory=list)   # glob patterns relative to root
+    languages: list[str] = field(default_factory=list)  # ["c","cpp","python","matlab"]
+
+
+@dataclass
+class RenderConfig:
+    """Render-slot configuration for the HTML view."""
+    view_slot_1: str = "function"
+    view_slot_2: str = "script"
+    render_level: str = "function"        # shorthand override for DOT/SVG (single image)
+    folder_depth: int = 2                  # how many path components define a "folder"
+
+
+@dataclass
+class IncludeGraphConfig:
+    enabled: bool = False
+    follow_system: bool = False            # render <stdio.h>-style system includes
+
+
+@dataclass
+class ParserConfig:
+    """Parser-level options shared across language parsers."""
+    expand_macros: bool = True             # C/C++: expand simple #define macros before parsing (idea C-1)
+
+
+@dataclass
+class ArchitectureConfig:
+    # module_name -> list of glob patterns relative to project root (first match wins)
+    modules: dict[str, list[str]] = field(default_factory=dict)
+    rules:   list[dict[str, Any]] = field(default_factory=list)
+    report:  Optional[str] = None          # JSON violation report path (CLI --architecture-report)
 
 
 @dataclass
@@ -59,6 +112,12 @@ class Config:
     filter: FilterConfig = field(default_factory=FilterConfig)
     variables: VariableConfig = field(default_factory=VariableConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    build: BuildConfig = field(default_factory=BuildConfig)
+    selection: SelectionConfig = field(default_factory=SelectionConfig)
+    render: RenderConfig = field(default_factory=RenderConfig)
+    include_graph: IncludeGraphConfig = field(default_factory=IncludeGraphConfig)
+    architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
+    parser: ParserConfig = field(default_factory=ParserConfig)
 
 
 def _merge_dict(base: dict, override: dict) -> dict:
@@ -70,6 +129,15 @@ def _merge_dict(base: dict, override: dict) -> dict:
         else:
             result[key] = val
     return result
+
+
+def _validate_render_level(value: str, where: str) -> str:
+    v = (value or "function").lower()
+    if v not in _VALID_RENDER_LEVELS:
+        raise ValueError(
+            f"Invalid {where} value: {value!r}. Expected one of: {', '.join(_VALID_RENDER_LEVELS)}"
+        )
+    return v
 
 
 def _dict_to_config(data: dict) -> Config:
@@ -113,6 +181,75 @@ def _dict_to_config(data: dict) -> Config:
             layout=o.get("layout", cfg.output.layout),
             max_nodes=o.get("max_nodes", cfg.output.max_nodes),
             node_size_scale=o.get("node_size_scale", cfg.output.node_size_scale),
+            parallel=o.get("parallel", cfg.output.parallel),
+            summary_by_file=o.get("summary_by_file", cfg.output.summary_by_file),
+        )
+
+    if "build" in data:
+        b = data["build"]
+        cfg.build = BuildConfig(
+            compile_commands=b.get("compile_commands", cfg.build.compile_commands),
+            auto_detect=b.get("auto_detect", cfg.build.auto_detect),
+            configuration=b.get("configuration", cfg.build.configuration),
+            platform=b.get("platform", cfg.build.platform),
+        )
+
+    if "selection" in data:
+        s = data["selection"]
+        cfg.selection = SelectionConfig(
+            projects=s.get("projects", cfg.selection.projects),
+            modules=s.get("modules", cfg.selection.modules),
+            folders=s.get("folders", cfg.selection.folders),
+            files=s.get("files", cfg.selection.files),
+            languages=s.get("languages", cfg.selection.languages),
+        )
+
+    if "render" in data:
+        r = data["render"]
+        cfg.render = RenderConfig(
+            view_slot_1=_validate_render_level(
+                r.get("view_slot_1", cfg.render.view_slot_1), "render.view_slot_1"
+            ),
+            view_slot_2=_validate_render_level(
+                r.get("view_slot_2", cfg.render.view_slot_2), "render.view_slot_2"
+            ),
+            render_level=_validate_render_level(
+                r.get("render_level", cfg.render.render_level), "render.render_level"
+            ),
+            folder_depth=int(r.get("folder_depth", cfg.render.folder_depth)),
+        )
+
+    if "include_graph" in data:
+        ig = data["include_graph"]
+        cfg.include_graph = IncludeGraphConfig(
+            enabled=ig.get("enabled", cfg.include_graph.enabled),
+            follow_system=ig.get("follow_system", cfg.include_graph.follow_system),
+        )
+
+    if "parser" in data:
+        p = data["parser"]
+        cfg.parser = ParserConfig(
+            expand_macros=p.get("expand_macros", cfg.parser.expand_macros),
+        )
+
+    if "architecture" in data:
+        a = data["architecture"]
+        modules_raw = a.get("modules") or {}
+        if not isinstance(modules_raw, dict):
+            raise ValueError("architecture.modules must be a mapping of name -> [glob, ...]")
+        normalised: dict[str, list[str]] = {}
+        for name, patterns in modules_raw.items():
+            if isinstance(patterns, str):
+                normalised[name] = [patterns]
+            else:
+                normalised[name] = list(patterns or [])
+        rules_raw = a.get("rules") or []
+        if not isinstance(rules_raw, list):
+            raise ValueError("architecture.rules must be a list of rule dicts")
+        cfg.architecture = ArchitectureConfig(
+            modules=normalised,
+            rules=[dict(r) for r in rules_raw],
+            report=a.get("report", cfg.architecture.report),
         )
 
     return cfg

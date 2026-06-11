@@ -86,7 +86,98 @@ def discover_files(project_root: str, config: Config) -> dict[Language, list[Pat
 
         result[lang].append(path)
 
-    return result
+    return apply_selection(result, config, root)
+
+
+# ---------------------------------------------------------------- #
+# Selection filter                                                  #
+# ---------------------------------------------------------------- #
+
+_LANG_KEYS = {
+    "python": Language.PYTHON,
+    "py":     Language.PYTHON,
+    "c":      Language.C,
+    "cpp":    Language.CPP,
+    "c++":    Language.CPP,
+    "matlab": Language.MATLAB,
+    "m":      Language.MATLAB,
+}
+
+
+def apply_selection(
+    files: dict[Language, list[Path]],
+    config: Config,
+    project_root: Path | None = None,
+) -> dict[Language, list[Path]]:
+    """Filter the discovered file dict by the selection config (folders/files/languages).
+
+    Project-level selection is applied earlier (during discover_from_sln). This helper
+    handles folder / file glob filters and language gates.
+    """
+    sel = getattr(config, "selection", None)
+    if sel is None:
+        return files
+
+    keep_langs: set[Language] | None = None
+    if sel.languages:
+        keep_langs = {_LANG_KEYS[k.lower()] for k in sel.languages if k.lower() in _LANG_KEYS}
+
+    folder_globs = list(sel.folders or [])
+    file_globs = list(sel.files or [])
+
+    if not (keep_langs or folder_globs or file_globs):
+        return files
+
+    out: dict[Language, list[Path]] = {lang: [] for lang in Language}
+    for lang, paths in files.items():
+        if keep_langs is not None and lang not in keep_langs:
+            continue
+        for p in paths:
+            rel = ""
+            if project_root is not None:
+                try:
+                    rel = str(p.resolve().relative_to(project_root).as_posix())
+                except (ValueError, OSError):
+                    rel = p.as_posix()
+            else:
+                rel = p.as_posix()
+            if folder_globs and not any(_glob_match(rel, pat) for pat in folder_globs):
+                continue
+            if file_globs and not any(_glob_match(rel, pat) for pat in file_globs):
+                # Fallback: try matching just the filename (handles files outside project root)
+                if not any(_glob_match(p.name, pat) for pat in file_globs):
+                    continue
+            out[lang].append(p)
+    return out
+
+
+def _glob_match(rel_path: str, pattern: str) -> bool:
+    """Glob with ``**`` support (mirrors architecture._glob_match)."""
+    import re as _re
+    pat = pattern.replace("\\", "/")
+    rel = rel_path.replace("\\", "/")
+    if "**" not in pat:
+        return fnmatch.fnmatch(rel, pat)
+    out: list[str] = []
+    i = 0
+    while i < len(pat):
+        ch = pat[i]
+        if ch == "*" and i + 1 < len(pat) and pat[i + 1] == "*":
+            out.append(".*")
+            i += 2
+            if i < len(pat) and pat[i] == "/":
+                i += 1
+        elif ch == "*":
+            out.append("[^/]*")
+            i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(_re.escape(ch))
+            i += 1
+    regex = "^" + "".join(out) + "$"
+    return _re.match(regex, rel) is not None
 
 
 def _walk_files(

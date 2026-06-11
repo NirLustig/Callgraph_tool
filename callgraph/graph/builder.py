@@ -41,37 +41,41 @@ class _ResolutionIndex:
         self,
         callee_name: str,
         caller_file: str,
-    ) -> tuple[str | None, ResolutionConfidence]:
+    ) -> tuple[str | None, ResolutionConfidence, str]:
         """
-        Return (node_id, confidence) using multi-tier matching.
+        Return (node_id, confidence, reason) using multi-tier matching.
         """
         # Tier 1: exact qualified match
         if callee_name in self._by_qualified:
-            return self._by_qualified[callee_name], ResolutionConfidence.EXACT
+            return (
+                self._by_qualified[callee_name],
+                ResolutionConfidence.EXACT,
+                "exact qualified match",
+            )
 
         # Tier 2: last segment of qualified match
         simple = callee_name.split("::")[-1].split(".")[-1]
         candidates = self._by_simple.get(simple, [])
 
         if not candidates:
-            return None, ResolutionConfidence.UNRESOLVED
+            return None, ResolutionConfidence.UNRESOLVED, "no matching function in project"
 
         if len(candidates) == 1:
-            return candidates[0], ResolutionConfidence.HEURISTIC
+            return candidates[0], ResolutionConfidence.HEURISTIC, "unique name match"
 
         # Tier 3: prefer same file
         caller_dir = str(Path(caller_file).parent)
         same_file = [c for c in candidates if caller_file in c]
         if same_file:
-            return same_file[0], ResolutionConfidence.HEURISTIC
+            return same_file[0], ResolutionConfidence.HEURISTIC, "same-file fallback"
 
         # Tier 4: prefer same directory
         same_dir = [c for c in candidates if caller_dir in c]
         if same_dir:
-            return same_dir[0], ResolutionConfidence.HEURISTIC
+            return same_dir[0], ResolutionConfidence.HEURISTIC, "same-directory fallback"
 
         # Tier 5: any match — return first
-        return candidates[0], ResolutionConfidence.HEURISTIC
+        return candidates[0], ResolutionConfidence.HEURISTIC, f"ambiguous ({len(candidates)} candidates)"
 
 
 # ------------------------------------------------------------------ #
@@ -156,12 +160,17 @@ def build_call_graph(
     stubs: dict[str, FunctionDef] = {}
 
     for call in raw_calls:
-        callee_id, confidence = index.resolve(call.callee_name, call.call_file)
+        callee_id, confidence, reason = index.resolve(call.callee_name, call.call_file)
 
         if callee_id:
             call.callee_id = callee_id
             call.is_resolved = True
             call.resolution_confidence = confidence
+            reason_full = reason + (f"; {call.resolution_hint}" if call.resolution_hint else "")
+            call.resolution_reason = reason_full
+            call.confidence_category = (
+                "exact" if confidence == ResolutionConfidence.EXACT else "heuristic"
+            )
         elif config.filter.show_external and not _is_likely_stdlib(call.callee_name):
             # Create external stub
             caller_fn = functions.get(call.caller_id)
@@ -172,6 +181,11 @@ def build_call_graph(
             call.callee_id = stub.node_id
             call.is_resolved = True
             call.resolution_confidence = ResolutionConfidence.UNRESOLVED
+            call.resolution_reason = "external stub"
+            call.confidence_category = "external"
+        else:
+            call.resolution_reason = reason
+            call.confidence_category = "unresolved"
 
         resolved_calls.append(call)
 
@@ -215,6 +229,91 @@ def build_call_graph(
     ))
 
     return graph
+
+
+def collapse_to_files(graph: CallGraph) -> CallGraph:
+    """
+    Derive a file-level summary graph: one synthetic FunctionDef per source file,
+    plus one CallRelationship per (src_file, dst_file) pair that had at least one
+    cross-file call in the original. Same-file calls are dropped.
+
+    Used by --summary-by-file to make 15K-function .sln projects navigable —
+    typically collapses ~hundreds of file-cards instead of 15K function nodes.
+    Per-function variable_flow data is lost in the summary (the per-function modal
+    is still useful via the existing Script Mode card → function pop-out).
+    """
+    from collections import Counter, defaultdict
+
+    file_to_fns: dict[str, list[FunctionDef]] = defaultdict(list)
+    for fn in graph.functions.values():
+        if fn.is_external or fn.file_path == "<external>":
+            continue
+        file_to_fns[fn.file_path].append(fn)
+
+    def _file_node_id(path: str) -> str:
+        import re as _re
+        safe = _re.sub(r"[^\w/\\.-]", "_", path)
+        return f"{safe}::<file>::0"
+
+    new_functions: dict[str, FunctionDef] = {}
+    file_id: dict[str, str] = {}
+    for fpath, fns in file_to_fns.items():
+        from pathlib import Path as _P
+        langs = [fn.language for fn in fns]
+        dom_lang = Counter(langs).most_common(1)[0][0] if langs else Language.C
+        nid = _file_node_id(fpath)
+        file_id[fpath] = nid
+        name = _P(fpath).name or fpath
+        synth = FunctionDef(
+            name=name,
+            qualified_name=fpath,
+            language=dom_lang,
+            file_path=fpath,
+            line_start=0,
+            line_end=0,
+        )
+        # The synthetic node_id must equal `nid` we computed above; FunctionDef.node_id
+        # is a property, so we mirror its derivation by giving it matching field values.
+        # (FunctionDef.node_id uses file_path + qualified_name + line_start.)
+        new_functions[nid] = synth
+
+    # Build cross-file edges from the resolved calls.
+    fn_to_file: dict[str, str] = {fn.node_id: fn.file_path for fn in graph.functions.values()
+                                  if not fn.is_external and fn.file_path != "<external>"}
+    seen_pairs: set[tuple[str, str]] = set()
+    new_calls: list[CallRelationship] = []
+    for call in graph.calls:
+        if not call.is_resolved or call.callee_id is None:
+            continue
+        src_file = fn_to_file.get(call.caller_id)
+        dst_file = fn_to_file.get(call.callee_id)
+        if not src_file or not dst_file or src_file == dst_file:
+            continue
+        src_id = file_id[src_file]
+        dst_id = file_id[dst_file]
+        pair = (src_id, dst_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        new_calls.append(CallRelationship(
+            caller_id=src_id,
+            callee_name=dst_id,
+            call_file=src_file,
+            call_line=0,
+            callee_id=dst_id,
+            is_resolved=True,
+            resolution_confidence=ResolutionConfidence.EXACT,
+        ))
+
+    out = CallGraph(
+        total_files_parsed=len(new_functions),
+        parse_errors=list(graph.parse_errors),
+    )
+    for fn in new_functions.values():
+        out.add_function(fn)
+    for c in new_calls:
+        out.add_call(c)
+    return out
 
 
 def to_networkx(graph: CallGraph) -> nx.DiGraph:
