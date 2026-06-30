@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import Config
-from ..models import CallRelationship, FunctionDef, Language, Parameter, ResolutionConfidence
+from ..models import CallRelationship, ClassInfo, FunctionDef, Language, Parameter, ResolutionConfidence
 from .base import BaseParser
 from .c_parser import (
     _check_available,
+    _attach_referenced_globals,
     _collect_fp_assignments,
     _dedup_variables,
     _detect_dead_variables,
@@ -93,6 +94,86 @@ def _extract_cpp_return_type(fn_node, source: bytes) -> Optional[str]:
     return " ".join(parts).strip() or None
 
 
+# ---------------------------------------------------------------------------- #
+# Class hierarchy capture (idea CPP-1 — virtual / override resolution)          #
+# ---------------------------------------------------------------------------- #
+
+def _has_virtual_marker(member_node, source: bytes) -> bool:
+    """True if a class member (field_declaration / function_definition) is marked
+    ``virtual`` or carries an ``override`` / ``final`` specifier.
+
+    Searches the member node but never descends into the function body
+    (``compound_statement``), so call sites inside the body can't trigger a
+    false positive.
+    """
+    stack = list(member_node.children)
+    while stack:
+        c = stack.pop()
+        if c.type == "compound_statement":
+            continue
+        if c.type in ("virtual", "virtual_function_specifier", "virtual_specifier"):
+            return True
+        stack.extend(c.children)
+    return False
+
+
+def _member_method_name(member_node, source: bytes) -> Optional[str]:
+    """Return the declared method simple name from a class-member declaration or
+    definition, or ``None`` if the member is not a function."""
+    declarator = _find_child_by_type(member_node, "function_declarator")
+    if declarator is None:
+        for child in member_node.children:
+            if child.type in ("pointer_declarator", "reference_declarator"):
+                declarator = _find_child_by_type(child, "function_declarator")
+                if declarator:
+                    break
+    if declarator is None:
+        return None
+    for child in declarator.children:
+        if child.type in ("identifier", "field_identifier"):
+            return _node_text(child, source).strip()
+        if child.type == "qualified_identifier":
+            return _node_text(child, source).split("::")[-1].strip()
+        if child.type == "destructor_name":
+            return _node_text(child, source).strip()
+    return None
+
+
+def _extract_base_classes(class_node, source: bytes) -> set:
+    """Collect base-class names from a class_specifier's ``base_class_clause``."""
+    bases: set = set()
+    clause = _find_child_by_type(class_node, "base_class_clause")
+    if clause is None:
+        return bases
+    for child in clause.children:
+        if child.type in ("type_identifier", "qualified_identifier", "template_type"):
+            text = _node_text(child, source).strip()
+            if text:
+                bases.add(text)
+    return bases
+
+
+def _collect_virtual_method_names(class_node, source: bytes) -> set:
+    """Simple names of every method in a class body marked virtual/override/final."""
+    names: set = set()
+    body = _find_child_by_type(class_node, "field_declaration_list")
+    if body is None:
+        return names
+    for member in body.children:
+        if member.type not in ("field_declaration", "function_definition",
+                                "declaration", "template_declaration"):
+            continue
+        target = member
+        if member.type == "template_declaration":
+            target = _find_child_by_type(member, "function_definition") or \
+                     _find_child_by_type(member, "field_declaration") or member
+        if _has_virtual_marker(target, source):
+            name = _member_method_name(target, source)
+            if name:
+                names.add(name.lstrip("~"))
+    return names
+
+
 class CppParser(BaseParser):
     LANGUAGE_NAME = "cpp"
 
@@ -103,6 +184,11 @@ class CppParser(BaseParser):
         # Tree-sitter Parser is not thread-safe — give each worker thread its own.
         import threading
         self._tls = threading.local()
+        # Aggregated class hierarchy (idea CPP-1). Populated per-file, merged here
+        # under a lock so the builder can resolve virtual/override dispatch across
+        # files (class declared in a header, methods defined in a .cpp).
+        self.class_registry: dict[str, ClassInfo] = {}
+        self._registry_lock = threading.Lock()
 
     def _get_parser(self):
         p = getattr(self._tls, "parser", None)
@@ -121,6 +207,7 @@ class CppParser(BaseParser):
         functions: list[FunctionDef] = []
         calls: list[CallRelationship] = []
         file_variables = []
+        self._tls.file_classes = {}   # per-file class hierarchy capture
 
         self._walk(
             tree.root_node, source_bytes, str(path),
@@ -130,8 +217,24 @@ class CppParser(BaseParser):
             namespace_stack=[],
             file_variables=file_variables,
         )
-        for fn in functions:
-            fn.variables = _dedup_variables(file_variables + fn.variables)
+        _attach_referenced_globals(functions, file_variables, source_bytes)
+
+        # Merge this file's class records into the shared registry.
+        file_classes = getattr(self._tls, "file_classes", {})
+        if file_classes:
+            with self._registry_lock:
+                for qual, info in file_classes.items():
+                    master = self.class_registry.get(qual)
+                    if master is None:
+                        self.class_registry[qual] = ClassInfo(
+                            name=qual,
+                            bases=set(info.bases),
+                            virtual_methods=set(info.virtual_methods),
+                        )
+                    else:
+                        master.bases.update(info.bases)
+                        master.virtual_methods.update(info.virtual_methods)
+        self._tls.file_classes = {}
         return functions, calls
 
     def _walk(
@@ -198,7 +301,18 @@ class CppParser(BaseParser):
             class_name = _find_child_by_type(node, "type_identifier")
             name_str = _node_text(class_name, source) if class_name else "anonymous"
             class_stack.append(name_str)
+            # Record class hierarchy for virtual/override resolution (idea CPP-1).
             body = _find_child_by_type(node, "field_declaration_list")
+            if body is not None and name_str != "anonymous":
+                class_qual = "::".join(namespace_stack + class_stack)
+                reg = getattr(self._tls, "file_classes", None)
+                if reg is not None:
+                    info = reg.get(class_qual)
+                    if info is None:
+                        info = ClassInfo(name=class_qual)
+                        reg[class_qual] = info
+                    info.bases.update(_extract_base_classes(node, source))
+                    info.virtual_methods.update(_collect_virtual_method_names(node, source))
             if body:
                 for child in body.children:
                     self._walk(child, source, file_path, functions, calls,
@@ -357,6 +471,7 @@ class CppParser(BaseParser):
             parent=parent,
             is_external=False,
             is_method=is_method,
+            is_virtual=_has_virtual_marker(node, source),
             func_type=ftype,
         )
 

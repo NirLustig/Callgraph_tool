@@ -41,6 +41,13 @@ class Parameter:
     name: str
     type_hint: Optional[str] = None
     is_dead: bool = False   # True if parameter is never referenced in the function body
+    # Dead-variable engine (parallel to VariableDef's fields; set for unused params)
+    dead_category: Optional[str] = None    # 'unused_param'
+    dead_confidence: Optional[str] = None  # 'high' | 'medium' | 'low'
+    read_lines: list[int] = field(default_factory=list)
+    write_lines: list[int] = field(default_factory=list)
+    is_suppressed: bool = False
+    suppress_reason: Optional[str] = None
 
     def __str__(self) -> str:
         if self.type_hint:
@@ -69,6 +76,20 @@ class VariableDef:
     custom_input_classifier: Optional[str] = None  # Third argument (source type/classifier)
     parent_name: Optional[str] = None              # For source_kind="member_access": the parent
                                                    # object/struct expression (e.g. "var" in "var.x")
+    assign_src: Optional[str] = None              # VFI-3: base var name of the RHS when this var is
+                                                   # directly assigned from another identifier
+                                                   # (e.g. "x" for `y = x;` or `y = fn(x);`)
+    doc_comment: Optional[str] = None             # VF-10: adjacent intent comment (above or inline)
+    full_source: Optional[str] = None             # Complete source statement line (e.g. "x = fn(a, b);")
+                                                   # used for the block's SOURCE row + modal display
+    # ── Dead-variable detection engine (read/write + scope liveness) ──────────
+    dead_category: Optional[str] = None     # 'unused' | 'dead_store' | 'unused_param'
+                                            # | 'dead_alloc' | 'unused_value'
+    dead_confidence: Optional[str] = None   # 'high' | 'medium' | 'low'
+    read_lines: list[int] = field(default_factory=list)   # evidence: lines that read the var
+    write_lines: list[int] = field(default_factory=list)  # evidence: lines that write the var
+    is_suppressed: bool = False             # True = intentional-unused, never flag (listed apart)
+    suppress_reason: Optional[str] = None   # e.g. "(void) discard", "[[maybe_unused]]", "_-prefixed"
 
 
 @dataclass
@@ -86,6 +107,7 @@ class FunctionDef:
     parent: Optional[str] = None   # Class name, namespace, or Python module
     is_external: bool = False      # Called but not defined in project
     is_method: bool = False
+    is_virtual: bool = False        # C++ virtual/override method (set by parser + finalised by builder)
     func_type: Optional[str] = None   # "function"|"method"|"constructor"|"destructor"|"local function"|"nested function"|"async function"|"script"|"operator"
     docstring: Optional[str] = None
     tracked_vars: dict[str, str] = field(default_factory=dict)  # {var_name: value_repr}
@@ -113,6 +135,19 @@ class ResolutionConfidence(str, Enum):
     EXACT = "EXACT"
     HEURISTIC = "HEURISTIC"
     UNRESOLVED = "UNRESOLVED"
+
+
+@dataclass
+class ClassInfo:
+    """C++ class/struct hierarchy record collected by the parser.
+
+    Aggregated across all files (a class may be declared in a header and defined
+    in a .cpp), then consumed by the call-graph builder to resolve virtual /
+    override method calls to every possible implementation (idea CPP-1).
+    """
+    name: str                                       # qualified name, e.g. "ns::Circle"
+    bases: set = field(default_factory=set)         # base class names as written in source
+    virtual_methods: set = field(default_factory=set)  # simple names declared virtual/override/final
 
 
 class RenderLevel(str, Enum):
@@ -198,6 +233,21 @@ class BuildInfo:
 # ---------------------------------------------------------------- #
 
 @dataclass
+class MatlabProjectInfo:
+    """G10: MATLAB project / search-path metadata (the MATLAB analogue of
+    :class:`BuildInfo`).  Collected purely from the file system — ``+package`` and
+    ``@class`` folders, ``.prj`` project files, and ``addpath``/``pathdef.m``
+    search-path directives — without any parser changes.
+    """
+    source: str = "filesystem"          # "filesystem" | "prj" | "pathdef" | "mixed"
+    project_files: list[str] = field(default_factory=list)    # discovered .prj paths
+    project_name: Optional[str] = None                        # name from a .prj, if any
+    packages: list[str] = field(default_factory=list)         # dotted names (+a/+b -> "a.b")
+    class_folders: list[str] = field(default_factory=list)    # @Class folder class names
+    addpath_dirs: list[str] = field(default_factory=list)     # dirs from addpath()/pathdef.m
+    warnings: list[str] = field(default_factory=list)
+
+@dataclass
 class ModuleDef:
     """A logical module — group of source files inferred or user-defined."""
     name: str
@@ -241,6 +291,7 @@ class IncludeEdge:
     resolved: bool = True
     raw_target: str = ""                # original text inside the quotes/angle brackets
     line: int = 0
+    guard: str = ""                     # INC-1: controlling #if/#ifdef condition, "" = unconditional
 
 
 @dataclass
@@ -249,6 +300,10 @@ class IncludeGraph:
     unresolved: list[IncludeEdge] = field(default_factory=list)
     cycles: list[list[str]] = field(default_factory=list)
     most_included: list[tuple[str, int]] = field(default_factory=list)
+    # INC-1: includes dropped because a preprocessor guard evaluated to a
+    # definite-false branch (e.g. the inactive side of an #ifdef whose macro is
+    # known-defined, or an #if 0 block). Each edge's ``guard`` records why.
+    excluded: list[IncludeEdge] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- #
@@ -270,6 +325,7 @@ class CallGraph:
     violations: list[ArchitectureViolation] = field(default_factory=list)
     render_level: RenderLevel = RenderLevel.FUNCTION
     project_root: Optional[str] = None      # absolute project root if known
+    matlab_project: Optional[MatlabProjectInfo] = None   # G10: MATLAB path/project metadata
 
     def add_function(self, fn: FunctionDef) -> None:
         self.functions[fn.node_id] = fn

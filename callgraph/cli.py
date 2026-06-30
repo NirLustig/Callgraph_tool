@@ -18,6 +18,7 @@ from . import __version__
 from . import architecture as arch_mod
 from . import build_info as build_info_mod
 from . import include_graph as include_graph_mod
+from . import matlab_module_graph as matlab_module_graph_mod
 from .aggregator import aggregate
 from .config import load_config, Config
 from .discovery import apply_selection, discover_files, summary
@@ -401,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     all_functions = []
     all_calls = []
     parse_errors = []
+    class_registry = {}   # qualified class name → ClassInfo (C++ virtual dispatch)
 
     with Progress(
         SpinnerColumn(),
@@ -418,6 +420,16 @@ def main(argv: list[str] | None = None) -> int:
             all_functions.extend(fns)
             all_calls.extend(calls)
             parse_errors.extend(errors)
+            # Collect C++ class hierarchy for virtual/override resolution (CPP-1).
+            reg = getattr(parser, "class_registry", None)
+            if reg:
+                for qual, info in reg.items():
+                    master = class_registry.get(qual)
+                    if master is None:
+                        class_registry[qual] = info
+                    else:
+                        master.bases.update(info.bases)
+                        master.virtual_methods.update(info.virtual_methods)
 
     console.print(f"  Parsed [green]{len(all_functions)}[/green] functions, "
                   f"[green]{len(all_calls)}[/green] raw calls, "
@@ -430,9 +442,30 @@ def main(argv: list[str] | None = None) -> int:
     # ---- stage 4: build call graph -----------------------------------------
     t0 = _stage_begin(4, _total_stages,
                       "Building call graph (dedup + resolve + filter + cap)")
-    graph = build_call_graph(all_functions, all_calls, parse_errors, cfg)
+    graph = build_call_graph(all_functions, all_calls, parse_errors, cfg,
+                             class_registry=class_registry)
     graph.build_info = build_info
     graph.project_root = str(project_root.resolve())
+
+    # G10: MATLAB project / search-path metadata (analogue of BuildInfo for C/C++).
+    if files.get(Language.MATLAB):
+        try:
+            from . import matlab_project as matlab_project_mod
+            graph.matlab_project = matlab_project_mod.discover_matlab_project(
+                project_root, files[Language.MATLAB]
+            )
+            mp = graph.matlab_project
+            if mp.packages or mp.class_folders or mp.project_files or mp.addpath_dirs:
+                console.print(
+                    f"  [cyan]MATLAB project:[/cyan] "
+                    f"{len(mp.packages)} package(s), "
+                    f"{len(mp.class_folders)} class folder(s), "
+                    f"{len(mp.project_files)} .prj, "
+                    f"{len(mp.addpath_dirs)} path dir(s) "
+                    f"[dim]({mp.source})[/dim]"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]Warning:[/yellow] MATLAB project discovery failed: {exc}")
     _stage_end(t0)
 
     # ---- module inference + architecture validation ------------------------
@@ -476,9 +509,12 @@ def main(argv: list[str] | None = None) -> int:
         # Use all project files (not the call-graph selection) so the include
         # graph always shows the full header dependency picture.
         c_files = []
+        m_files = []
         for lang, paths in _all_files_for_ig.items():
             if lang in (Language.C, Language.CPP):
                 c_files.extend(paths)
+            elif lang == Language.MATLAB:
+                m_files.extend(paths)
         if c_files:
             try:
                 graph.include_graph = include_graph_mod.build_include_graph(
@@ -495,6 +531,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except Exception as exc:
                 console.print(f"[yellow]Warning:[/yellow] include graph build failed: {exc}")
+        # MATLAB module/dependency graph (G5) — synthesised from cross-file calls
+        # plus addpath/run directives, merged into the same IncludeGraph for display.
+        if m_files:
+            try:
+                module_graph = matlab_module_graph_mod.build_matlab_module_graph(
+                    m_files,
+                    list(graph.functions.values()),
+                    graph.calls,
+                    project_root=project_root,
+                )
+                graph.include_graph = matlab_module_graph_mod.merge_into(
+                    graph.include_graph, module_graph
+                )
+                console.print(
+                    f"  [cyan]MATLAB module graph:[/cyan] "
+                    f"{len(module_graph.files)} file(s), "
+                    f"{len(module_graph.cycles)} cycle(s)."
+                )
+            except Exception as exc:
+                console.print(f"[yellow]Warning:[/yellow] MATLAB module graph build failed: {exc}")
 
     stats = graph.stats()
     _print_stats(stats, total_files)

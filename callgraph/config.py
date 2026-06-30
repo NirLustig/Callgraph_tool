@@ -56,6 +56,14 @@ class OutputConfig:
     node_size_scale: float = 1.0
     parallel: Optional[int] = None    # parser worker threads; None = auto-detect
     summary_by_file: bool = False     # collapse 1-node-per-function to 1-node-per-file
+    compress_payload: Any = "auto"    # PERF-5: embed graph JSON as zlib+base64.
+    #   "auto" (default) = compress payloads above a size threshold; True = always;
+    #   False = never (plain JSON literals, legacy behaviour).
+    virtualize_dom: Any = "auto"      # PERF-8: viewport virtualisation for DOM modes
+    #   (Script / Variable-Flow / Include / Module). Renders only on-screen node
+    #   cards via CSS content-visibility, keeping big-solution graphs responsive.
+    #   "auto" (default) = enable above a node-count threshold; True = always;
+    #   False = never (legacy behaviour, every node fully laid out).
 
 
 @dataclass
@@ -183,6 +191,8 @@ def _dict_to_config(data: dict) -> Config:
             node_size_scale=o.get("node_size_scale", cfg.output.node_size_scale),
             parallel=o.get("parallel", cfg.output.parallel),
             summary_by_file=o.get("summary_by_file", cfg.output.summary_by_file),
+            compress_payload=o.get("compress_payload", cfg.output.compress_payload),
+            virtualize_dom=o.get("virtualize_dom", cfg.output.virtualize_dom),
         )
 
     if "build" in data:

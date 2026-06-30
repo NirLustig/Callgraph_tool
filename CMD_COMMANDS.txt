@@ -47,6 +47,98 @@ BASIC USAGE
        python callgraph_tool.py --project ./my_project --output graph.html --verbose
 
 
+COMPILE_COMMANDS.JSON SUPPORT
+-----------------------------
+  When a C/C++ project produces compile_commands.json (clang/CMake), the tool can
+  read it for per-file include paths and preprocessor defines.  Auto-detected in
+  the project root, ./build/, or ./out/ folders.
+
+  Explicit path:
+       python callgraph_tool.py --project ./my_project \
+           --compile-commands ./build/compile_commands.json \
+           --output graph.html
+
+  The HTML output gains a "Build Info" sidebar panel showing the loaded units,
+  configuration/platform (when a .sln is also used), and any mismatches between
+  the file list and the compilation database.
+
+
+RENDER SLOTS (NEW)
+------------------
+  The HTML output now has TWO configurable view buttons (slot 1 and slot 2).
+  Default values reproduce today's UI exactly:  function + script.
+
+  Slot levels:
+    function   one node per function
+    script     one node per file (today's Script Nodes)
+    folder     one node per folder (depth configurable in YAML render.folder_depth)
+    module     one node per module (config-driven or auto-inferred)
+    library    one node per .vcxproj / project
+    namespace  one node per namespace / class
+
+  Examples:
+       # Function in slot 1, Module in slot 2 (architecture overview)
+       python callgraph_tool.py --project ./src --view-slot-1 function --view-slot-2 module --output graph
+
+       # Folder vs Module: high-level architecture comparison
+       python callgraph_tool.py --project ./src --view-slot-1 folder --view-slot-2 module --output graph
+
+       # DOT / SVG only — single image at module level
+       python callgraph_tool.py --project ./src --formats svg --render-level module --output arch.svg
+
+
+INCLUDE GRAPH MODE
+------------------
+  Build a separate "Include Graph" view alongside the call graph.  Parses
+  #include directives in C/C++ files; classifies system vs local; resolves
+  local includes against compile_commands.json / .vcxproj include paths.
+
+       python callgraph_tool.py --project ./src --include-graph --output graph.html
+
+  The HTML output gains a 4th sidebar button. A sidebar checkbox toggles
+  visibility of <stdio.h>-style system headers (hidden by default).
+
+
+ARCHITECTURE RULES + VIOLATIONS
+-------------------------------
+  Define module mappings and dependency rules in YAML config (see
+  config.example.yaml: architecture: section).  Rule kinds: forbidden,
+  allowed_only, required, layer.  Violations show as red edges in every
+  view; a "Violations" sidebar modal lists them.
+
+       python callgraph_tool.py --project ./src --config arch.yaml \
+           --architecture-report violations.json --output graph.html
+
+
+.SLN PROJECT SELECTION
+----------------------
+  Restrict analysis to specific .vcxproj projects (substring match, case-insensitive):
+
+       python callgraph_tool.py --project ./My.sln --include-projects MyApp MyLib --output graph
+
+  Restrict to specific file globs (relative to project root):
+
+       python callgraph_tool.py --project ./src --include-files "src/control/**" "src/drivers/**" --output graph
+
+  .SLN INSPECTOR (machine-readable; used by the GUI):
+
+       python callgraph_tool.py --project ./My.sln --inspect-sln > sln.json
+
+
+CONFIDENCE
+----------
+  Every resolved call now carries a confidence category (exact / heuristic /
+  unresolved / external / aggregated / violation) and a short resolution
+  reason.  Edges are styled in the HTML output:
+    exact      solid blue
+    heuristic  dashed orange
+    unresolved gray dashed
+    external   gray dashed
+    aggregated thick blue (with underlying-count tooltip)
+    violation  bold red
+  The sidebar Confidence section has per-category visibility checkboxes.
+
+
 SUPPORTED LANGUAGES
 -------------------
   .py             Python   (built-in ast module)

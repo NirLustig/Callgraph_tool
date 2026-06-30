@@ -297,6 +297,13 @@ class _PythonVisitor(ast.NodeVisitor):
         self._func_stack.pop()
         fn.variables.extend(ctx.variables)
 
+        # Dead-variable / liveness post-pass (exact ast Load/Store/Del analysis).
+        try:
+            from . import _liveness
+            _liveness.detect_dead_variables_python(fn, node)
+        except Exception:
+            pass
+
         # Apply tracked variables collected during visit
         if self.config.variables.track and ctx.var_assignments:
             for fn_def in self.functions:

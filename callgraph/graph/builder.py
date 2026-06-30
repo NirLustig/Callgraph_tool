@@ -8,7 +8,7 @@ from pathlib import Path
 import networkx as nx
 
 from ..config import Config
-from ..models import CallGraph, CallRelationship, FunctionDef, Language, ResolutionConfidence
+from ..models import CallGraph, CallRelationship, ClassInfo, FunctionDef, Language, ResolutionConfidence
 from .filters import (
     apply_node_cap,
     bfs_depth_filter,
@@ -79,6 +79,181 @@ class _ResolutionIndex:
 
 
 # ------------------------------------------------------------------ #
+# Class hierarchy — virtual / override dispatch (idea CPP-1)           #
+# ------------------------------------------------------------------ #
+
+class _ClassHierarchy:
+    """Resolves C++ virtual / override method calls to every possible
+    implementation by following the class inheritance graph.
+
+    Built from the parser's aggregated ``ClassInfo`` registry plus the resolved
+    ``FunctionDef`` set. A method call is treated as virtual when the callee
+    method name is declared ``virtual`` / ``override`` anywhere in the inheritance
+    component that owns the matched class. The call then fans out to the method
+    of the same name in every class of that component (base + all overrides),
+    since static analysis cannot know the dynamic type.
+    """
+
+    def __init__(self, functions: dict[str, FunctionDef],
+                 registry: dict[str, ClassInfo] | None) -> None:
+        registry = registry or {}
+
+        # Registry keys are namespace-qualified (e.g. "geo::Circle"); out-of-line
+        # method definitions may carry a shorter parent (e.g. "Circle"). Canonicalise
+        # so both map to the same class node.
+        reg_keys = set(registry.keys())
+        reg_suffix: dict[str, set[str]] = {}
+        for k in reg_keys:
+            reg_suffix.setdefault(k.split("::")[-1], set()).add(k)
+
+        def canonical(name: str) -> str:
+            if name in reg_keys:
+                return name
+            cands = [k for k in reg_suffix.get(name.split("::")[-1], set())
+                     if k == name or k.endswith("::" + name)]
+            return cands[0] if len(cands) == 1 else name
+        self._canonical = canonical
+
+        classes: set[str] = set(reg_keys)
+        for fn in functions.values():
+            if fn.parent and (fn.is_method or fn.func_type in
+                              ("method", "constructor", "destructor", "operator")):
+                classes.add(canonical(fn.parent))
+        self.classes = classes
+
+        # last-segment → {qualified class names} for resolving unqualified bases
+        self._suffix: dict[str, set[str]] = {}
+        for c in classes:
+            self._suffix.setdefault(c.split("::")[-1], set()).add(c)
+
+        # Resolve base names to known class qualified names.
+        self._bases: dict[str, set[str]] = {}
+        self._virtual_names: dict[str, set[str]] = {}
+        for c in classes:
+            info = registry.get(c)
+            resolved: set[str] = set()
+            if info:
+                for b in info.bases:
+                    resolved |= self._resolve(b)
+                self._virtual_names[c] = set(info.virtual_methods)
+            else:
+                self._virtual_names[c] = set()
+            self._bases[c] = resolved
+
+        # Union-find over (undirected) inheritance edges → components.
+        self._comp = self._components()
+
+        # Virtual method names propagated across each component.
+        self._comp_virtual: dict[str, set[str]] = {}
+        for c in classes:
+            cid = self._comp[c]
+            self._comp_virtual.setdefault(cid, set()).update(self._virtual_names.get(c, set()))
+
+        # (class, simple_name) → [node_id, ...] for every method definition.
+        self._methods: dict[tuple[str, str], list[str]] = {}
+        for nid, fn in functions.items():
+            if fn.parent:
+                self._methods.setdefault((canonical(fn.parent), fn.name), []).append(nid)
+
+    def _resolve(self, name: str) -> set[str]:
+        if name in self.classes:
+            return {name}
+        return set(self._suffix.get(name.split("::")[-1], set()))
+
+    def _components(self) -> dict[str, str]:
+        parent = {c: c for c in self.classes}
+
+        def find(x: str) -> str:
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        for c, bs in self._bases.items():
+            for b in bs:
+                if b in parent:
+                    ra, rb = find(c), find(b)
+                    if ra != rb:
+                        parent[ra] = rb
+        return {c: find(c) for c in self.classes}
+
+    def is_virtual_method(self, class_qual: str, name: str) -> bool:
+        cid = self._comp.get(self._canonical(class_qual))
+        if cid is None:
+            return False
+        return name in self._comp_virtual.get(cid, set())
+
+    def implementations(self, class_qual: str, name: str) -> list[str]:
+        """node_ids of every method named ``name`` within ``class_qual``'s component."""
+        cid = self._comp.get(self._canonical(class_qual))
+        if cid is None:
+            return []
+        out: list[str] = []
+        for (cls, m), nids in self._methods.items():
+            if m == name and self._comp.get(cls) == cid:
+                out.extend(nids)
+        return out
+
+
+def _apply_virtual_dispatch(
+    functions: dict[str, FunctionDef],
+    resolved_calls: list[CallRelationship],
+    hierarchy: _ClassHierarchy,
+) -> list[CallRelationship]:
+    """Mark virtual methods and fan resolved virtual calls out to every override.
+
+    Returns the list of extra edges to append. Edges already present (explicit
+    source calls or the primary resolved edge) are not duplicated.
+    """
+    # Finalise is_virtual on every method node (covers cross-file / out-of-line).
+    for fn in functions.values():
+        if fn.parent and not fn.is_virtual and hierarchy.is_virtual_method(fn.parent, fn.name):
+            fn.is_virtual = True
+
+    existing: set[tuple[str, str]] = set()
+    for call in resolved_calls:
+        if call.callee_id:
+            existing.add((call.caller_id, call.callee_id))
+
+    extra: list[CallRelationship] = []
+    for call in resolved_calls:
+        if not call.callee_id:
+            continue
+        target = functions.get(call.callee_id)
+        if target is None or not target.parent:
+            continue
+        if not hierarchy.is_virtual_method(target.parent, target.name):
+            continue
+        if "virtual dispatch" not in call.resolution_reason:
+            call.resolution_reason = (
+                (call.resolution_reason + "; virtual dispatch").strip("; ")
+            )
+        for impl_id in hierarchy.implementations(target.parent, target.name):
+            if impl_id == call.callee_id:
+                continue
+            pair = (call.caller_id, impl_id)
+            if pair in existing:
+                continue
+            existing.add(pair)
+            impl_fn = functions[impl_id]
+            extra.append(CallRelationship(
+                caller_id=call.caller_id,
+                callee_name=impl_fn.qualified_name,
+                call_file=call.call_file,
+                call_line=call.call_line,
+                callee_id=impl_id,
+                is_resolved=True,
+                resolution_confidence=ResolutionConfidence.HEURISTIC,
+                resolution_reason=f"virtual dispatch \u2192 {impl_fn.qualified_name}",
+                confidence_category="heuristic",
+                resolution_hint="virtual override",
+            ))
+    return extra
+
+
+# ------------------------------------------------------------------ #
 # Deduplication                                                        #
 # ------------------------------------------------------------------ #
 
@@ -143,6 +318,7 @@ def build_call_graph(
     raw_calls: list[CallRelationship],
     parse_errors: list[str],
     config: Config,
+    class_registry: dict[str, ClassInfo] | None = None,
 ) -> CallGraph:
     graph = CallGraph(
         total_files_parsed=0,   # updated by caller if needed
@@ -191,6 +367,13 @@ def build_call_graph(
 
     # Merge stubs into functions
     functions.update(stubs)
+
+    # Step 3b: virtual / override dispatch fan-out (idea CPP-1)
+    if class_registry:
+        hierarchy = _ClassHierarchy(functions, class_registry)
+        resolved_calls.extend(
+            _apply_virtual_dispatch(functions, resolved_calls, hierarchy)
+        )
 
     # Step 4: apply filters
     functions = filter_functions_by_name(functions, config)

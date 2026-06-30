@@ -100,6 +100,154 @@ def _node_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
+_STATEMENT_NODE_TYPES = frozenset({
+    "declaration",
+    "expression_statement",
+    "field_declaration",
+    "init_declarator",
+    "assignment_expression",
+    "return_statement",
+    "if_statement",
+    "for_statement",
+    "while_statement",
+})
+
+
+def _full_statement_text(node, source: bytes, cap: int = 200) -> Optional[str]:
+    """Return the complete source statement enclosing `node`, whitespace-collapsed.
+
+    Walks up to the nearest statement-like ancestor (declaration / expression
+    statement) so the SOURCE row shows the whole line of code — e.g.
+    ``raw_speed = lugasi(pThis, s_strc, NULL);`` rather than just the RHS.
+    A trailing ``;`` is preserved; interior runs of whitespace/newlines are
+    collapsed to single spaces so multi-line statements read on one line.
+    """
+    if node is None:
+        return None
+    stmt = node
+    # Prefer the enclosing expression_statement / declaration so we capture the
+    # left-hand side + terminator, not just the assignment/initializer subtree.
+    cur = node
+    hops = 0
+    while cur is not None and hops < 6:
+        if cur.type in ("expression_statement", "declaration", "field_declaration"):
+            stmt = cur
+            break
+        cur = cur.parent
+        hops += 1
+    text = _node_text(stmt, source)
+    # Collapse all whitespace runs (incl. newlines) to single spaces.
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    if len(text) > cap:
+        text = text[: cap - 1].rstrip() + "…"
+    return text
+
+
+# ------------------------------------------------------------------ #
+# VF-10: adjacent intent-comment extraction                            #
+# ------------------------------------------------------------------ #
+# Covers four common patterns:
+#   1. Inline right-side:  float speed;  // raw speed from sensor
+#   2. Line immediately above:  // Raw speed\n  float speed;
+#   3. Multiple // lines above (treated as one block)
+#   4. /* ... */ block comment above (multi-line doc style), even with
+#      one blank line between the comment and the declaration.
+#
+# A single blank line between the comment and the declaration is still
+# allowed (the programmer sometimes adds breathing room).  Two or more
+# blank lines are treated as "not related".
+# ---------------------------------------------------------------------------
+
+def _inline_comment_from_line(line_text: str) -> Optional[str]:
+    """Return the text of a // or /* */ comment on the right side of a source line."""
+    # Strip string and char literals so // inside a string is not mistaken
+    stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line_text)
+    stripped = re.sub(r"'(?:[^'\\]|\\.)*'", "''", stripped)
+    m = re.search(r'//+\s*(.+)', stripped)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'/\*+\s*(.*?)\s*\*+/', stripped)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return None
+
+
+def _comment_above(start_line: int, lines: list) -> Optional[str]:
+    """Walk upward from start_line collecting adjacent comment text.
+
+    *lines* is source.split(b'\\n').  Allows exactly one blank line gap.
+    """
+    i = start_line
+    if i < 0 or i >= len(lines):
+        return None
+    txt = lines[i].decode("utf-8", errors="replace").strip()
+    # Allow one blank line between comment and declaration
+    if not txt:
+        i -= 1
+        if i < 0 or i >= len(lines):
+            return None
+        txt = lines[i].decode("utf-8", errors="replace").strip()
+        if not txt:
+            return None  # two blank lines → not related
+    # --- Consecutive // comment lines ----
+    if txt.startswith("//"):
+        collected: list[str] = []
+        j = i
+        while j >= 0:
+            t = lines[j].decode("utf-8", errors="replace").strip()
+            if t.startswith("//"):
+                clean = re.sub(r'^//+\s*', '', t).strip()
+                if clean:
+                    collected.append(clean)
+                j -= 1
+            else:
+                break
+        if collected:
+            collected.reverse()
+            return " ".join(collected[:5])  # cap at 5 merged lines
+    # --- Block comment /* ... */ ending on this line ---
+    if "*/" in txt:
+        block: list[str] = []
+        j = i
+        while j >= 0:
+            t = lines[j].decode("utf-8", errors="replace").strip()
+            # Strip common doc-comment delimiters / doxygen prefixes
+            clean = re.sub(r'^/?\*+\s*', '', t).rstrip("*/").strip()
+            # Skip doxygen @ / \ directives
+            if clean.startswith(("@", "\\")):
+                j -= 1
+                continue
+            if clean:
+                block.append(clean)
+            if t.startswith("/*") or t.startswith("/**") or t.startswith("/*!"):
+                break
+            j -= 1
+        block = [b for b in block if b]
+        if block:
+            block.reverse()
+            return " ".join(block[:5])
+    return None
+
+
+def _extract_adjacent_comment(line_0: int, source: bytes) -> Optional[str]:
+    """Extract the best adjacent intent comment for a declaration at *line_0* (0-based).
+
+    Priority order: inline right-side → comments above.
+    """
+    lines = source.split(b'\n')
+    if line_0 < 0 or line_0 >= len(lines):
+        return None
+    # Case 1: inline right-side
+    decl_text = lines[line_0].decode("utf-8", errors="replace")
+    inline = _inline_comment_from_line(decl_text)
+    if inline:
+        return inline
+    # Cases 2-4: above
+    return _comment_above(line_0 - 1, lines)
+
+
 def _find_children_by_type(node, type_name: str) -> list:
     return [c for c in node.children if c.type == type_name]
 
@@ -252,6 +400,31 @@ def _find_call_names(node, source: bytes) -> list[str]:
     return names
 
 
+def _extract_assign_src(value_node, source: bytes) -> Optional[str]:
+    """Return the source variable name for cross-var assignment edges (VFI-3).
+
+    Returns the base name when the RHS is:
+    - a direct identifier:   ``y = x``    -> ``"x"``
+    - a single-identifier call: ``y = fn(x)`` -> ``"x"``
+
+    Returns None for literals, multi-arg calls, and complex expressions.
+    """
+    if value_node is None:
+        return None
+    if value_node.type == "identifier":
+        name = _node_text(value_node, source).strip()
+        return name if name else None
+    if value_node.type == "call_expression":
+        args_node = _find_child_by_type(value_node, "argument_list")
+        if args_node:
+            id_args = [c for c in args_node.children
+                       if c.is_named and c.type == "identifier"]
+            if len(id_args) == 1:
+                name = _node_text(id_args[0], source).strip()
+                return name if name else None
+    return None
+
+
 def _classify_value_node(value_node, source: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
     if value_node is None:
         return None, None, None
@@ -333,9 +506,11 @@ def _build_variable_def(
     file_path: str,
     context: Optional[str],
     source: bytes,
+    doc_comment: Optional[str] = None,
+    full_source: Optional[str] = None,
 ) -> VariableDef:
     source_kind, source_detail, inferred_type = _classify_value_node(value_node, source)
-    return VariableDef(
+    vdef = VariableDef(
         name=name,
         scope=kind,
         type_hint=type_hint or inferred_type,
@@ -345,7 +520,14 @@ def _build_variable_def(
         context=context,
         source_kind=source_kind,
         source_detail=source_detail,
+        doc_comment=doc_comment or None,
+        full_source=full_source or None,
     )
+    # VFI-3: record the source variable name for cross-variable assignment edges.
+    assign_src = _extract_assign_src(value_node, source)
+    if assign_src and assign_src.lower() != name.lower():
+        vdef.assign_src = assign_src
+    return vdef
 
 
 def _extract_variables_from_declaration(
@@ -372,6 +554,7 @@ def _extract_variables_from_declaration(
         value_node = _extract_initializer_node(child)
         value = _extract_initializer_value(child, source)
         kind = _choose_variable_kind(name, default_scope, decl_node, storage, value_node, source)
+        doc_comment = _extract_adjacent_comment(child.start_point[0], source)
         variables.append(_build_variable_def(
             name=name,
             kind=kind,
@@ -382,6 +565,8 @@ def _extract_variables_from_declaration(
             file_path=file_path,
             context=context,
             source=source,
+            doc_comment=doc_comment,
+            full_source=_full_statement_text(child, source),
         ))
 
     return variables
@@ -460,6 +645,7 @@ def _extract_assignment_variable(
         file_path=file_path,
         context=context,
         source=source,
+        full_source=_full_statement_text(node, source),
     )
 
 
@@ -473,6 +659,57 @@ def _dedup_variables(variables: list[VariableDef]) -> list[VariableDef]:
         seen.add(key)
         result.append(var)
     return result
+
+
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _identifier_tokens_in_range(text_lines: list[str], start: int, end: int) -> set[str]:
+    """Set of identifier tokens appearing in source lines [start, end] (1-indexed)."""
+    names: set[str] = set()
+    lo = max(start - 1, 0)
+    hi = max(end, lo)
+    for line in text_lines[lo:hi]:
+        names.update(_IDENT_TOKEN_RE.findall(line))
+    return names
+
+
+def _attach_referenced_globals(
+    functions: list[FunctionDef],
+    file_variables: list[VariableDef],
+    source_bytes: bytes,
+) -> None:
+    """Attach file-scope (global) variables to each function (G8).
+
+    Previously *every* file-scope global was prepended to *every* function's
+    ``variables`` list, which is O(functions x globals) in both time and memory
+    (a 500-function file with 1,000 globals produced ~500,000 records).  Instead
+    we attach a global to a function only when the function body actually
+    references that identifier — which is both far cheaper and more correct
+    (variable-flow no longer shows globals a function never touches).
+    """
+    if not file_variables:
+        for fn in functions:
+            fn.variables = _dedup_variables(fn.variables)
+        return
+
+    from collections import defaultdict
+    by_name: dict[str, list[VariableDef]] = defaultdict(list)
+    for var in file_variables:
+        by_name[var.name].append(var)
+
+    text_lines = source_bytes.decode("utf-8", "replace").splitlines()
+    for fn in functions:
+        used = _identifier_tokens_in_range(
+            text_lines, fn.line_start, fn.line_end or fn.line_start
+        )
+        relevant: list[VariableDef] = []
+        for name in used:
+            bucket = by_name.get(name)
+            if bucket:
+                relevant.extend(bucket)
+        relevant.sort(key=lambda v: v.line)
+        fn.variables = _dedup_variables(relevant + fn.variables)
 
 
 # ------------------------------------------------------------------ #
@@ -493,46 +730,19 @@ def _collect_identifiers_in_subtree(node, source: bytes) -> list[tuple[str, int]
 
 def _detect_dead_variables(fn: "FunctionDef", body_node, source: bytes) -> None:
     """
-    Post-pass: mark fn.variables as dead if only referenced at their declaration line,
-    and mark fn.parameters as dead if never referenced in the body at all.
-    Only considers function-scoped variables (local, static, dynamic, field).
+    Post-pass: classify dead variables/parameters using the shared read/write +
+    lexical-scope liveness engine (``_liveness.detect_dead_variables_c``).
+
+    Replaces the former name-based heuristic. The new engine resolves each
+    reference to its nearest enclosing declaration (case-sensitive), distinguishes
+    reads from writes, reasons about pointers/allocation, and suppresses
+    intentional-unused names — populating the richer ``dead_category`` /
+    ``dead_confidence`` / ``read_lines`` / ``write_lines`` fields while still
+    deriving the legacy ``is_dead`` / ``dead_reason`` flags for back-compat.
     """
-    from collections import defaultdict
+    from . import _liveness
 
-    all_ids = _collect_identifiers_in_subtree(body_node, source)
-
-    # name (lower) → set of lines where that identifier appears
-    name_to_lines: dict[str, set[int]] = defaultdict(set)
-    for id_name, id_line in all_ids:
-        name_to_lines[id_name.lower()].add(id_line)
-
-    # All identifier names seen anywhere in the body (for param checks)
-    all_id_names_lower: set[str] = set(name_to_lines.keys())
-
-    _TRACKED_SCOPES = {"local", "static", "dynamic", "field"}
-    # Synthetic call-site occurrence records (LUGASI dest, .Connect receiver)
-    # are not declarations and must not participate in "declared but never
-    # used" detection — otherwise a standalone LUGASI block with no other
-    # reference to its dest would be marked dead and disappear from the
-    # Variable Flow view.
-    _SYNTHETIC_SOURCE_KINDS = {"custom_input", "input_file_connect"}
-    for var in fn.variables:
-        if (var.scope or "").lower() not in _TRACKED_SCOPES:
-            continue
-        if (var.source_kind or "") in _SYNTHETIC_SOURCE_KINDS:
-            continue
-        vname = var.name.lower()
-        lines = name_to_lines.get(vname, set())
-        uses_beyond_decl = {ln for ln in lines if ln != var.line}
-        if not uses_beyond_decl:
-            var.is_dead = True
-            var.dead_reason = "declared but never used"
-
-    for param in fn.parameters:
-        if not param.name or param.name.lower() in ("self", "cls"):
-            continue
-        if param.name.lower() not in all_id_names_lower:
-            param.is_dead = True
+    _liveness.detect_dead_variables_c(fn, body_node, source)
 
 
 # ------------------------------------------------------------------ #
@@ -759,6 +969,8 @@ def _extract_connect_call(
         connect_path=path_str,
         connect_input_name=input_name,
         value=_node_text(call_node, source).strip()[:120],
+        doc_comment=_extract_adjacent_comment(call_node.start_point[0], source),
+        full_source=_full_statement_text(call_node, source),
     )
 
 
@@ -834,6 +1046,8 @@ def _extract_connect_free_func_call(
         custom_input_func=func_name,
         parent_name=dest_parent,
         value=_node_text(call_node, source).strip()[:120],
+        doc_comment=_extract_adjacent_comment(call_node.start_point[0], source),
+        full_source=_full_statement_text(call_node, source),
     )
 
 
@@ -924,6 +1138,8 @@ def _extract_custom_input_call(
         custom_input_classifier=classifier,
         parent_name=dest_parent,
         value=call_text,
+        doc_comment=_extract_adjacent_comment(call_node.start_point[0], source),
+        full_source=_full_statement_text(call_node, source),
     )
 
 
@@ -998,6 +1214,7 @@ def _extract_member_access(
         source_detail=access_expr[:120],
         parent_name=parent_text[:80],
         value=access_expr[:80],
+        full_source=_full_statement_text(field_expr, source),
     )
 
 
@@ -1345,8 +1562,7 @@ class CParser(BaseParser):
                    current_func=None, namespace_stack=[],
                    file_variables=file_variables)
 
-        for fn in functions:
-            fn.variables = _dedup_variables(file_variables + fn.variables)
+        _attach_referenced_globals(functions, file_variables, source_bytes)
 
         return functions, calls
 

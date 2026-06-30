@@ -3,7 +3,7 @@
 > **Offline, self-contained static call-graph, variable-flow, and architecture analyser**  
 > for **C, C++, Python, and MATLAB** — with a single-file interactive HTML output.
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 
 ---
@@ -21,9 +21,12 @@ CallGraph Analyzer scans your source code and produces a **fully self-contained 
 | **Script Nodes** | File-level view with collapsible cards, callee badges colour-coded by location (same file / other file / external) |
 | **Function Nodes** | Function-level canvas with drag, search, isolate, highlight, and depth-limited traversal |
 | **Module View** | Aggregated module-level graph auto-inferred from folder structure or YAML config |
+| **Nodebook** | Capture any view as a restorable "favorites" page (live state, not a screenshot) — reopen, rename, reorder, export/import |
 | **Visual Studio .sln** | Reads `.sln` + `.vcxproj` to discover and analyse all C/C++ source files automatically |
 | **Macro expansion** | Conservative `#define` pre-pass so calls hidden behind macros resolve correctly |
 | **Function-pointer resolution** | Detects `fp = handler;` / `fp = target;` assignments and resolves pointer calls to real callees |
+| **Virtual dispatch resolution** | C++ `virtual`/`override` calls fan out to every implementation in the class hierarchy; virtual methods carry a badge in all modes |
+| **Compressed HTML payload** | Large embedded graph JSON is zlib + base64-compressed and inflated in-browser at startup — cuts file size up to 5–10× while staying 100% self-contained (`output.compress_payload`) |
 
 ---
 
@@ -37,7 +40,7 @@ CallGraph Analyzer scans your source code and produces a **fully self-contained 
 
 | Requirement | Version |
 |---|---|
-| Python | 3.12 or later |
+| Python | 3.9 or later |
 | pip | any recent version |
 | Graphviz binary *(optional)* | for SVG / PNG output — [graphviz.org](https://graphviz.org/download/) |
 
@@ -416,6 +419,33 @@ include_graph:
 - Use this mode to find **headers that are included everywhere** (candidates for pre-compiled headers or refactoring).
 - Cycles in the include graph are a common source of compilation order problems — this mode makes them immediately visible.
 - System headers are hidden by default; enable them only when you need to see stdlib dependencies.
+
+---
+
+## 📓 Nodebook — saved view favorites
+
+The **Nodebook** is a personal favorites book baked into every generated HTML. Capture the
+current view from *any* mode as a **page** — it stores the **live, restorable view-state**
+(mode + filter/search + custom node layout + pan/zoom + selected variable), *not* a dead
+screenshot. Reopen the HTML the next day, browse your pages, and click one to get the exact
+interactive view back.
+
+**How to use:**
+
+| Action | How |
+|---|---|
+| Capture the current view | Press **N**, or click **➕ Capture** in the mode-button row → a new page is added, auto-titled from the active filter (e.g. `VarFlow · raw_speed`) |
+| Open the gallery | Press **B**, or click the **📓 Nodebook** tab → grid of saved pages with thumbnails |
+| Restore a page | Click **Open** on a card → switches to that page's mode and replays its state |
+| Re-capture after editing | Open a page, rearrange it, click **Update** → saves the new arrangement into the same page |
+| Rename / reorder / delete | Click a card title to rename; drag a card to reorder; **Delete** to remove |
+| Share / back up | **Export** writes a `.nodebook.json`; **Import** merges one in on another machine |
+
+**Notes:**
+- Pages auto-save to the browser's `localStorage`, scoped per generated graph.
+- Thumbnails are rendered **fully offline** (no internet, no extra libraries), so the HTML
+  stays 100% self-contained.
+- The book starts **empty** — nothing is captured until you press **N**.
 
 ---
 

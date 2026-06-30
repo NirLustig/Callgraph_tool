@@ -11,9 +11,11 @@ Layout strategy:
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
+import zlib
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
@@ -30,6 +32,58 @@ except ImportError:
 
 
 # ------------------------------------------------------------------ #
+# PERF-5 — embedded payload compression                              #
+# ------------------------------------------------------------------ #
+# Large graphs embed multi-MB JSON literals into the self-contained HTML.
+# We zlib-deflate the JSON (raw DEFLATE, no header) and base64-encode it,
+# then decode + inflate synchronously in the browser via the embedded
+# `__cgJ` helper below. This keeps the output 100% self-contained
+# (no CDN, Rule 8) while cutting file size ~5-10x on large projects.
+
+# Only serialized payloads at least this many bytes are compressed under the
+# "auto" policy. Below this the ~6 KB inflate helper isn't worth embedding.
+_COMPRESS_THRESHOLD = 32 * 1024
+
+
+def _deflate_b64(s: str) -> str:
+    """Raw-DEFLATE + base64 a UTF-8 string for synchronous browser inflation."""
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    raw = co.compress(s.encode("utf-8")) + co.flush()
+    return base64.b64encode(raw).decode("ascii")
+
+
+# Synchronous raw-DEFLATE (RFC 1951) inflate + base64->UTF-8->JSON helper.
+# Standard tinf-style algorithm; no third-party code. Exposes window.__cgJ
+# so embedded payloads become `var X = __cgJ("<base64>");`.
+_DECOMP_JS = r"""
+<script id="cg-decomp-js">
+(function (root) {
+  "use strict";
+  function Tree(){this.table=new Uint16Array(16);this.trans=new Uint16Array(288);}
+  function Data(s){this.s=s;this.i=0;this.tag=0;this.bitcount=0;this.dest=[];this.ltree=new Tree();this.dtree=new Tree();}
+  var LENGTH_BITS=new Uint8Array(30),LENGTH_BASE=new Uint16Array(30),DIST_BITS=new Uint8Array(30),DIST_BASE=new Uint16Array(30);
+  var CLCIDX=new Uint8Array([16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]);
+  var sltree=new Tree(),sdtree=new Tree(),offs=new Uint16Array(16);
+  function buildBitsBase(bits,base,delta,first){var i,sum;for(i=0;i<delta;++i)bits[i]=0;for(i=0;i<30-delta;++i)bits[i+delta]=(i/delta)|0;for(sum=first,i=0;i<30;++i){base[i]=sum;sum+=1<<bits[i];}}
+  function buildFixedTrees(lt,dt){var i;for(i=0;i<7;++i)lt.table[i]=0;lt.table[7]=24;lt.table[8]=152;lt.table[9]=112;for(i=0;i<24;++i)lt.trans[i]=256+i;for(i=0;i<144;++i)lt.trans[24+i]=i;for(i=0;i<8;++i)lt.trans[24+144+i]=280+i;for(i=0;i<112;++i)lt.trans[24+144+8+i]=144+i;for(i=0;i<5;++i)dt.table[i]=0;dt.table[5]=32;for(i=0;i<32;++i)dt.trans[i]=i;}
+  function buildTree(t,lengths,off,num){var i,sum;for(i=0;i<16;++i)t.table[i]=0;for(i=0;i<num;++i)t.table[lengths[off+i]]++;t.table[0]=0;for(sum=0,i=0;i<16;++i){offs[i]=sum;sum+=t.table[i];}for(i=0;i<num;++i){if(lengths[off+i])t.trans[offs[lengths[off+i]]++]=i;}}
+  function getBit(d){if(d.bitcount--===0){d.tag=d.s[d.i++];d.bitcount=7;}var bit=d.tag&1;d.tag>>>=1;return bit;}
+  function readBits(d,num,base){if(!num)return base;while(d.bitcount<24){d.tag|=d.s[d.i++]<<d.bitcount;d.bitcount+=8;}var val=d.tag&(0xffff>>>(16-num));d.tag>>>=num;d.bitcount-=num;return val+base;}
+  function decodeSymbol(d,t){while(d.bitcount<24){d.tag|=d.s[d.i++]<<d.bitcount;d.bitcount+=8;}var sum=0,cur=0,len=0,tag=d.tag;do{cur=2*cur+(tag&1);tag>>>=1;++len;sum+=t.table[len];cur-=t.table[len];}while(cur>=0);d.tag=tag;d.bitcount-=len;return t.trans[sum+cur];}
+  function decodeTrees(d,lt,dt){var lengths=new Uint8Array(320),hlit,hdist,hclen,i,num,length;hlit=readBits(d,5,257);hdist=readBits(d,5,1);hclen=readBits(d,4,4);for(i=0;i<19;++i)lengths[i]=0;for(i=0;i<hclen;++i){lengths[CLCIDX[i]]=readBits(d,3,0);}buildTree(d.ltree,lengths,0,19);for(num=0;num<hlit+hdist;){var sym=decodeSymbol(d,d.ltree);switch(sym){case 16:var prev=lengths[num-1];for(length=readBits(d,2,3);length;--length)lengths[num++]=prev;break;case 17:for(length=readBits(d,3,3);length;--length)lengths[num++]=0;break;case 18:for(length=readBits(d,7,11);length;--length)lengths[num++]=0;break;default:lengths[num++]=sym;break;}}buildTree(lt,lengths,0,hlit);buildTree(dt,lengths,hlit,hdist);}
+  function inflateBlockData(d,lt,dt){while(true){var sym=decodeSymbol(d,lt);if(sym===256)return;if(sym<256){d.dest.push(sym);}else{var length,dist,o2,i;sym-=257;length=readBits(d,LENGTH_BITS[sym],LENGTH_BASE[sym]);dist=decodeSymbol(d,dt);o2=d.dest.length-readBits(d,DIST_BITS[dist],DIST_BASE[dist]);for(i=o2;i<o2+length;++i){d.dest.push(d.dest[i]);}}}}
+  function inflateUncompressedBlock(d){var length,invlength;while(d.bitcount>8){d.i--;d.bitcount-=8;}length=d.s[d.i+1];length=256*length+d.s[d.i];invlength=d.s[d.i+3];invlength=256*invlength+d.s[d.i+2];if(length!==(~invlength&0x0000ffff))throw new Error("inflate: bad length");d.i+=4;for(var i=length;i;--i)d.dest.push(d.s[d.i++]);d.bitcount=0;}
+  function inflate(source){var d=new Data(source),bfinal,btype;do{bfinal=getBit(d);btype=readBits(d,2,0);if(btype===0){inflateUncompressedBlock(d);}else if(btype===1){inflateBlockData(d,sltree,sdtree);}else if(btype===2){decodeTrees(d,d.ltree,d.dtree);inflateBlockData(d,d.ltree,d.dtree);}else{throw new Error("inflate: bad block type");}}while(!bfinal);return Uint8Array.from(d.dest);}
+  buildBitsBase(LENGTH_BITS,LENGTH_BASE,4,3);buildBitsBase(DIST_BITS,DIST_BASE,2,1);LENGTH_BITS[28]=0;LENGTH_BASE[28]=258;buildFixedTrees(sltree,sdtree);
+  function b64ToBytes(b64){var bin=root.atob(b64),len=bin.length,bytes=new Uint8Array(len);for(var i=0;i<len;++i)bytes[i]=bin.charCodeAt(i);return bytes;}
+  function cgJ(b64){var bytes=inflate(b64ToBytes(b64));var text=new root.TextDecoder("utf-8").decode(bytes);return JSON.parse(text);}
+  root.__cgInflate=inflate;root.__cgJ=cgJ;
+})(window);
+</script>
+"""
+
+
+
 # Color constants                                                     #
 # ------------------------------------------------------------------ #
 
@@ -93,22 +147,858 @@ _RENDER_LEVEL_LABELS: dict[str, str] = {
     "namespace": "Namespace Nodes",
 }
 
+# Root-rank border colors (gold / silver / bronze)
+ROOT_BORDERS = {1: "#FFD700", 2: "#C0C0C0", 3: "#CD7F32"}
+ROOT_LABELS  = {1: "👑 Root #1", 2: "★ Root #2", 3: "★ Root #3"}
+# Crown / star label suffix added to vis.js node labels for root nodes
+ROOT_SUFFIX  = {1: "\n👑 Root #1", 2: "\n★ Root #2", 3: "\n★ Root #3"}
 
+# Name-bonus table for root scoring
+_ROOT_NAME_BONUSES = {
+    "main":     10_000,
+    "Main":      9_000,
+    "__main__":  9_500,
+    "run":       2_000,
+    "start":     2_000,
+    "entry":     2_000,
+    "launch":    2_000,
+    "execute":   2_000,
+    "init":      1_500,
+    "app":       1_000,
+}
+_ROOT_FILE_PREFIX_BONUS = 5_000   # file basename starts with main/app/run/index
+_ROOT_MATLAB_SCRIPT_BONUS = 8_000  # MATLAB func_type == 'script'
+
+
+def _compute_root_ranks(graph: "CallGraph") -> dict[str, int]:
+    """Return {node_id: rank} for the top-3 root candidates (rank 1 = best).
+
+    Algorithm:
+    1. Build in_degree from internal (non-external) edges.
+    2. Zero-in-degree nodes are candidates.  Fallback: all non-external nodes
+       if the graph is fully cyclic (every node has callers).
+    3. BFS downstream from each candidate → subtree_size (unique reachable nodes).
+    4. score = name_bonus + subtree_size.  Top 3 unique node_ids → ranks 1/2/3.
+    """
+    import os
+    from collections import deque
+
+    node_ids = set(graph.functions.keys())
+    if not node_ids:
+        return {}
+
+    # Build adjacency and in-degree only among internal non-external nodes.
+    adj: dict[str, list[str]] = {n: [] for n in node_ids}
+    in_deg: dict[str, int]    = {n: 0  for n in node_ids}
+    for c in graph.calls:
+        if c.caller_id in node_ids and c.callee_id in node_ids and c.caller_id != c.callee_id:
+            if not graph.functions[c.callee_id].is_external:
+                adj[c.caller_id].append(c.callee_id)
+                in_deg[c.callee_id] += 1
+
+    # Candidate pool: zero-in-degree AND not external.
+    candidates = [n for n in node_ids
+                  if in_deg[n] == 0 and not graph.functions[n].is_external]
+    if not candidates:
+        # Fully cyclic: use lowest-in-degree non-external nodes as fallback.
+        min_deg = min((in_deg[n] for n in node_ids
+                       if not graph.functions[n].is_external), default=0)
+        candidates = [n for n in node_ids
+                      if in_deg[n] == min_deg and not graph.functions[n].is_external]
+
+    # BFS subtree size for each candidate.
+    def bfs_size(start: str) -> int:
+        visited: set[str] = {start}
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in adj.get(u, []):
+                if v not in visited:
+                    visited.add(v)
+                    q.append(v)
+        return len(visited) - 1   # exclude origin itself
+
+    # Score each candidate.
+    scores: list[tuple[float, str]] = []
+    for nid in candidates:
+        fn = graph.functions[nid]
+        bonus = 0
+        # Name bonus
+        bonus += _ROOT_NAME_BONUSES.get(fn.name, 0)
+        # MATLAB script
+        if fn.func_type == "script":
+            bonus += _ROOT_MATLAB_SCRIPT_BONUS
+        # File basename prefix bonus
+        bname = os.path.basename(fn.file_path).lower()
+        if any(bname.startswith(p) for p in ("main", "app", "run", "index")):
+            bonus += _ROOT_FILE_PREFIX_BONUS
+        score = bonus + bfs_size(nid)
+        scores.append((score, nid))
+
+    scores.sort(key=lambda t: -t[0])
+
+    result: dict[str, int] = {}
+    for rank, (_, nid) in enumerate(scores[:3], start=1):
+        result[nid] = rank
+    return result
+
+
+def _compute_include_root_ranks(ig: "IncludeGraph") -> dict[str, int]:
+    """Return {file_path: rank} top-3 root candidates for include graph.
+
+    Root = project header that nothing else includes (zero in-degree among
+    project files) AND has the largest transitive include subtree.
+    """
+    import os
+    from collections import deque
+
+    all_files = set(ig.files.keys())
+    if not all_files:
+        return {}
+
+    # Build adjacency and in-degree (project files only, skip system includes)
+    adj: dict[str, list[str]] = {f: [] for f in all_files}
+    in_deg: dict[str, int] = {f: 0 for f in all_files}
+    for src, edges in ig.files.items():
+        for e in edges:
+            if e.is_system:
+                continue
+            dst = e.to_file if e.resolved else None
+            if dst and dst in all_files and dst != src:
+                adj[src].append(dst)
+                in_deg[dst] += 1
+
+    candidates = [f for f in all_files if in_deg[f] == 0]
+    if not candidates:
+        min_d = min(in_deg.values(), default=0)
+        candidates = [f for f in all_files if in_deg[f] == min_d]
+
+    def bfs_size(start: str) -> int:
+        visited: set[str] = {start}
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in adj.get(u, []):
+                if v not in visited:
+                    visited.add(v)
+                    q.append(v)
+        return len(visited) - 1
+
+    _ROOT_INC_NAME_BONUS = {
+        "main": 8_000,
+        "stdafx": 6_000,
+        "pch": 5_000,
+        "config": 3_000,
+        "precomp": 4_000,
+    }
+    scores: list[tuple[float, str]] = []
+    for fp in candidates:
+        bname = os.path.splitext(os.path.basename(fp).lower())[0]
+        bonus = _ROOT_INC_NAME_BONUS.get(bname, 0)
+        score = bonus + bfs_size(fp)
+        scores.append((score, fp))
+
+    scores.sort(key=lambda t: -t[0])
+    result: dict[str, int] = {}
+    for rank, (_, fp) in enumerate(scores[:3], start=1):
+        result[fp] = rank
+    return result
+
+
+
+
+# ================================================================== #
+# Smart Top-Down Callgraph Layout (Sugiyama-style)                    #
 # ------------------------------------------------------------------ #
-# Multi-component layout                                              #
-# ------------------------------------------------------------------ #
+# Replaces the old rigid "file-lane" layout. Goals: keep callers above #
+# callees (top-down), minimise edge crossings (barycenter sweeps),     #
+# keep connected nodes close, treat same-file proximity as a SOFT      #
+# preference, avoid a huge horizontal span and a fake-root top layer,  #
+# pack disconnected components in 2D, and stay fully deterministic.    #
+# Pure Python, runs at generation time. Not a force-directed layout.   #
+# ================================================================== #
+
+_SL_BARYCENTER_SWEEPS = 16
+_SL_MAX_ROOTS_PER_COMPONENT = 30
+_SL_COMPONENT_MARGIN_X = 800.0
+_SL_COMPONENT_MARGIN_Y = 600.0
+_SL_MAX_PACKING_ROW_WIDTH = 10000.0
+_SL_X_COMPACT_PASSES = 4
+
+# --- Size-aware spacing (prevents node overlap) ----------------------- #
+# vis.js renders nodes as monospace 11px "box" shapes; box width follows the
+# widest label line. These estimate the real footprint so layout reserves
+# enough room and nothing is placed on top of another node.
+_SL_CHAR_W = 7.2          # px per monospace char at the rendered font size
+_SL_LABEL_PAD_X = 30.0    # box horizontal padding (both sides)
+_SL_LINE_H = 16.0         # px per label line
+_SL_LABEL_PAD_Y = 24.0    # box vertical padding
+_SL_MIN_NODE_W = 90.0
+_SL_MIN_NODE_H = 44.0
+_SL_PAD_X = 80.0          # min clear gap between two node boxes in a row
+_SL_ROW_GAP_Y = 80.0      # gap between wrapped sub-rows inside one layer
+_SL_SCC_PAD = 44.0        # padding between members inside an expanded SCC block
+# Rectangle shaping: wide layers wrap into stacked sub-rows so a large graph
+# reads as a rectangle (not a downward triangle) and the horizontal span shrinks.
+_SL_TARGET_ASPECT = 1.7   # desired width : height ratio for a component
+_SL_KEEP_BEST_MAX_NODES = 1500  # cap for crossing-count keep-best (perf bound)
+
+# Architectural-root name bonuses (real entry points score high).
+_SL_ROOT_NAME_BONUS = {
+    "main": 1000.0, "entry": 600.0, "start": 500.0, "run": 500.0,
+    "init": 400.0, "setup": 400.0, "loop": 350.0, "step": 350.0,
+    "process": 350.0, "execute": 350.0, "update": 300.0, "handle": 300.0,
+    "callback": 300.0,
+}
+# Substrings that mark a node as a low-priority root candidate.
+_SL_DEPRIORITIZE = ("test", "mock", "stub", "fake", "dummy", "helper",
+                    "util", "getter", "setter", "scratch", "generated")
+
+
+def _sl_sweeps_for(n_total: int) -> int:
+    """Auto-scale barycenter sweeps down for very large graphs (deterministic)."""
+    if n_total > 10000:
+        return 4
+    if n_total > 5000:
+        return 6
+    return _SL_BARYCENTER_SWEEPS
+
+
+def _sl_median(vals: list[float]) -> float:
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    m = len(s)
+    return s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
+
+
+def _sl_estimate_size(label: str) -> tuple[float, float]:
+    """Estimate a node's rendered box (w, h) in px from its label text.
+
+    Mirrors the vis.js monospace "box" sizing: width follows the widest line,
+    height follows the line count. Used so layout reserves the real footprint
+    and never stacks two boxes on the same spot."""
+    lines = label.split("\n") if label else [""]
+    longest = max((len(ln) for ln in lines), default=0)
+    w = longest * _SL_CHAR_W + _SL_LABEL_PAD_X
+    h = len(lines) * _SL_LINE_H + _SL_LABEL_PAD_Y
+    return (max(w, _SL_MIN_NODE_W), max(h, _SL_MIN_NODE_H))
+
+
+def _sl_supernode_geometry(
+    sccs: list[list[str]],
+    node_sizes: dict[str, tuple[float, float]],
+    name_of: dict[str, str],
+    line_of: dict[str, int],
+) -> tuple[list[float], list[float], list[dict[str, tuple[float, float]]]]:
+    """Per super-node footprint (width, height) and member offsets.
+
+    Single-node SCCs use the node box size. Multi-node SCCs are laid out as a
+    compact square-ish grid; the block's full width/height is reserved so its
+    members never spill over neighbouring nodes or into adjacent layers."""
+    import math
+    n = len(sccs)
+    sw = [0.0] * n
+    sh = [0.0] * n
+    offsets: list[dict[str, tuple[float, float]]] = [dict() for _ in range(n)]
+    for i, scc in enumerate(sccs):
+        members = sorted(scc, key=lambda m: (line_of.get(m, 0), name_of.get(m, ""), m))
+        if len(members) == 1:
+            w, h = node_sizes.get(members[0], (_SL_MIN_NODE_W, _SL_MIN_NODE_H))
+            sw[i], sh[i] = w, h
+            offsets[i] = {members[0]: (0.0, 0.0)}
+            continue
+        k = len(members)
+        cols = max(1, int(math.ceil(math.sqrt(k))))
+        rows = int(math.ceil(k / cols))
+        cellw = max(node_sizes.get(m, (_SL_MIN_NODE_W, _SL_MIN_NODE_H))[0]
+                    for m in members) + _SL_SCC_PAD
+        cellh = max(node_sizes.get(m, (_SL_MIN_NODE_W, _SL_MIN_NODE_H))[1]
+                    for m in members) + _SL_SCC_PAD
+        sw[i] = cols * cellw
+        sh[i] = rows * cellh
+        off: dict[str, tuple[float, float]] = {}
+        for idx, m in enumerate(members):
+            r, c = divmod(idx, cols)
+            off[m] = ((c - (cols - 1) / 2.0) * cellw,
+                      (r - (rows - 1) / 2.0) * cellh)
+        offsets[i] = off
+    return sw, sh, offsets
+
+
+def _sl_weak_components(
+    nodes: set[str],
+    successors: dict[str, set[str]],
+    predecessors: dict[str, set[str]],
+) -> list[list[str]]:
+    """Weakly-connected components, sorted by (-size, min node id)."""
+    seen: set[str] = set()
+    comps: list[list[str]] = []
+    for s in sorted(nodes):
+        if s in seen:
+            continue
+        comp: list[str] = []
+        dq = deque([s])
+        seen.add(s)
+        while dq:
+            u = dq.popleft()
+            comp.append(u)
+            for v in successors.get(u, ()):  # noqa: SIM118
+                if v in nodes and v not in seen:
+                    seen.add(v)
+                    dq.append(v)
+            for v in predecessors.get(u, ()):  # noqa: SIM118
+                if v in nodes and v not in seen:
+                    seen.add(v)
+                    dq.append(v)
+        comps.append(comp)
+    comps.sort(key=lambda c: (-len(c), min(c)))
+    return comps
+
+
+def _sl_tarjan_scc(
+    comp_nodes: list[str], successors: dict[str, set[str]]
+) -> tuple[list[list[str]], dict[str, int]]:
+    """Iterative Tarjan SCC. Returns (sccs, node->scc_index).
+    SCCs come out in reverse-topological order (sinks first)."""
+    comp_set = set(comp_nodes)
+    index_of: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    sccs: list[list[str]] = []
+    node_to_scc: dict[str, int] = {}
+    counter = 0
+    for root in sorted(comp_nodes):
+        if root in index_of:
+            continue
+        index_of[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work: list[tuple[str, object]] = [
+            (root, iter(sorted(successors.get(root, ()))))
+        ]
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for w in it:  # type: ignore[assignment]
+                if w not in comp_set:
+                    continue
+                if w not in index_of:
+                    index_of[w] = low[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(sorted(successors.get(w, ())))))
+                    advanced = True
+                    break
+                if w in on_stack and index_of[w] < low[node]:
+                    low[node] = index_of[w]
+            if advanced:
+                continue
+            if low[node] == index_of[node]:
+                scc: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    scc.append(w)
+                    node_to_scc[w] = len(sccs)
+                    if w == node:
+                        break
+                sccs.append(scc)
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                if low[node] < low[parent]:
+                    low[parent] = low[node]
+    return sccs, node_to_scc
+
+
+def _sl_condense(
+    sccs: list[list[str]],
+    node_to_scc: dict[str, int],
+    comp_nodes: list[str],
+    successors: dict[str, set[str]],
+) -> tuple[list[set[int]], list[set[int]]]:
+    """Build the SCC-condensed DAG (super-node adjacency)."""
+    n = len(sccs)
+    dsucc: list[set[int]] = [set() for _ in range(n)]
+    dpred: list[set[int]] = [set() for _ in range(n)]
+    for u in comp_nodes:
+        su = node_to_scc[u]
+        for v in successors.get(u, ()):
+            sv = node_to_scc.get(v)
+            if sv is not None and sv != su:
+                dsucc[su].add(sv)
+                dpred[sv].add(su)
+    return dsucc, dpred
+
+
+def _sl_scc_file(sccs: list[list[str]], file_of: dict[str, str]) -> list[str]:
+    """Dominant file per SCC (most common member file; min on tie)."""
+    out: list[str] = []
+    for scc in sccs:
+        counts: dict[str, int] = defaultdict(int)
+        for m in scc:
+            counts[file_of.get(m, "")] += 1
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        out.append(best[0][0] if best else "")
+    return out
+
+
+def _sl_select_roots(
+    sccs: list[list[str]],
+    dsucc: list[set[int]],
+    dpred: list[set[int]],
+    scc_file: list[str],
+    name_of: dict[str, str],
+    file_of: dict[str, str],
+) -> set[int]:
+    """Pick real architectural roots among zero-in-degree SCCs (cap MAX_ROOTS)."""
+    cand = [i for i in range(len(sccs)) if not dpred[i]]
+    if not cand:
+        return set()
+
+    def score(i: int) -> float:
+        members = sccs[i]
+        name_bonus = 0.0
+        penalty = 0.0
+        for m in members:
+            nm = name_of.get(m, "").lower()
+            fp = file_of.get(m, "").lower()
+            if nm in _SL_ROOT_NAME_BONUS:
+                name_bonus = max(name_bonus, _SL_ROOT_NAME_BONUS[nm])
+            else:
+                for key, val in _SL_ROOT_NAME_BONUS.items():
+                    if nm.startswith(key):
+                        name_bonus = max(name_bonus, val * 0.6)
+            if any(k in nm or k in fp for k in _SL_DEPRIORITIZE):
+                penalty += 50.0
+        fanout = len(dsucc[i])
+        cross_file = sum(1 for sv in dsucc[i] if scc_file[sv] != scc_file[i])
+        return name_bonus + fanout * 5.0 + cross_file * 3.0 - penalty
+
+    def name_bonus_of(i: int) -> float:
+        b = 0.0
+        for m in sccs[i]:
+            nm = name_of.get(m, "").lower()
+            if nm in _SL_ROOT_NAME_BONUS:
+                b = max(b, _SL_ROOT_NAME_BONUS[nm])
+            else:
+                for key, val in _SL_ROOT_NAME_BONUS.items():
+                    if nm.startswith(key):
+                        b = max(b, val * 0.6)
+        return b
+
+    # A source is a REAL architectural root only with a positive signal:
+    # an entry-point name, high fan-out, or cross-file reach. Trivial no-signal
+    # sources are left for the pull-down so they don't clutter the top layer.
+    def qualifies(i: int) -> bool:
+        return (name_bonus_of(i) > 0.0
+                or len(dsucc[i]) >= 3
+                or sum(1 for sv in dsucc[i] if scc_file[sv] != scc_file[i]) >= 2)
+
+    qualified = [i for i in cand if qualifies(i)]
+    if not qualified:
+        # Anchor: keep the single best-scoring source so the component has a top.
+        best = min(cand, key=lambda i: (-score(i), min(sccs[i])))
+        return {best}
+    ranked = sorted(qualified, key=lambda i: (-score(i), min(sccs[i])))
+    return set(ranked[:_SL_MAX_ROOTS_PER_COMPONENT])
+
+
+def _sl_assign_layers(
+    n: int, dsucc: list[set[int]], dpred: list[set[int]], roots: set[int]
+) -> list[int]:
+    """Layer assignment ranked FROM selected roots, sinking non-root sources.
+
+    1. Selected roots sit at layer 0; longest-path forward ranks everything
+       reachable from a root.
+    2. Nodes NOT reachable from any root (the would-be "fake roots" and their
+       exclusive subtrees) are pushed DOWN (ALAP) to just above their earliest
+       ranked successor — so they plug into the tree at the right depth instead
+       of piling in layer 0.
+    3. A final downward-correction guarantees every caller sits above its callee.
+    """
+    indeg = [len(dpred[i]) for i in range(n)]
+    dq = deque(sorted(i for i in range(n) if indeg[i] == 0))
+    topo: list[int] = []
+    rem = indeg[:]
+    while dq:
+        u = dq.popleft()
+        topo.append(u)
+        for v in sorted(dsucc[u]):
+            rem[v] -= 1
+            if rem[v] == 0:
+                dq.append(v)
+
+    layer: list[int | None] = [None] * n
+    for r in roots:
+        layer[r] = 0
+
+    # (1) Longest path forward from roots over the topological order.
+    for u in topo:
+        if layer[u] is None:
+            continue
+        for v in dsucc[u]:
+            nl = layer[u] + 1
+            if layer[v] is None or nl > layer[v]:
+                layer[v] = nl
+
+    # (2) ALAP sink for unreachable nodes: reverse topo so successors are known.
+    for u in reversed(topo):
+        if layer[u] is not None:
+            continue
+        succ_layers = [layer[v] for v in dsucc[u] if layer[v] is not None]
+        if succ_layers:
+            layer[u] = max(0, min(succ_layers) - 1)
+
+    # Any still-unranked nodes (isolated subgraphs with no ranked successor):
+    # rank by longest path from their own sources.
+    for u in topo:
+        if layer[u] is not None:
+            continue
+        pred_layers = [layer[p] for p in dpred[u] if layer[p] is not None]
+        layer[u] = (max(pred_layers) + 1) if pred_layers else 0
+
+    lay = [int(x) for x in layer]  # type: ignore[arg-type]
+
+    # (3) Downward-correction: enforce caller strictly above callee on every edge.
+    for u in topo:
+        for v in dsucc[u]:
+            if lay[v] <= lay[u]:
+                lay[v] = lay[u] + 1
+    return lay
+
+
+def _sl_count_crossings(
+    order: dict[int, list[int]],
+    layer_ids: list[int],
+    layer: list[int],
+    dsucc: list[set[int]],
+) -> int:
+    """Count crossings on consecutive-layer edges for the given ordering."""
+    pos: dict[int, int] = {}
+    for L in layer_ids:
+        for idx, i in enumerate(order[L]):
+            pos[i] = idx
+    total = 0
+    for li in range(len(layer_ids) - 1):
+        upper = layer_ids[li]
+        lower_layer = layer_ids[li + 1]
+        pairs: list[tuple[int, int]] = []
+        for u in order[upper]:
+            for v in dsucc[u]:
+                if layer[v] == lower_layer and v in pos:
+                    pairs.append((pos[u], pos[v]))
+        pairs.sort()
+        # count inversions in the second coordinate
+        seconds = [p[1] for p in pairs]
+        for a in range(len(seconds)):
+            for b in range(a + 1, len(seconds)):
+                if seconds[b] < seconds[a]:
+                    total += 1
+    return total
+
+
+def _sl_order_layers(
+    layer: list[int],
+    n: int,
+    dsucc: list[set[int]],
+    dpred: list[set[int]],
+    tie_key,
+    sweeps: int,
+) -> tuple[dict[int, list[int]], list[int]]:
+    """Barycenter/median sweeps to minimise crossings. Returns (order, layer_ids).
+
+    Tracks the lowest-crossing ordering seen across all sweeps and returns that
+    (keep-best), so extra sweeps can only help — never regress."""
+    layers: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        layers[layer[i]].append(i)
+    layer_ids = sorted(layers)
+    order = {L: sorted(layers[L], key=tie_key) for L in layer_ids}
+    pos: dict[int, int] = {}
+    for L in layer_ids:
+        for idx, i in enumerate(order[L]):
+            pos[i] = idx
+
+    keep_best = n <= _SL_KEEP_BEST_MAX_NODES and len(layer_ids) > 1
+    best_order = {L: list(order[L]) for L in layer_ids} if keep_best else order
+    best_cross = (_sl_count_crossings(order, layer_ids, layer, dsucc)
+                  if keep_best else 0)
+
+    for s in range(sweeps):
+        down = (s % 2 == 0)
+        seq = layer_ids[1:] if down else layer_ids[-2::-1]
+        adj = dpred if down else dsucc
+        for L in seq:
+            def bary(i: int) -> float:
+                nb = adj[i]
+                ps = [pos[x] for x in nb if x in pos]
+                return _sl_median(ps) if ps else float(pos[i])
+            order[L] = sorted(order[L], key=lambda i: (bary(i), tie_key(i)))
+            for idx, i in enumerate(order[L]):
+                pos[i] = idx
+        if keep_best:
+            c = _sl_count_crossings(order, layer_ids, layer, dsucc)
+            if c < best_cross:
+                best_cross = c
+                best_order = {L: list(order[L]) for L in layer_ids}
+    return best_order, layer_ids
+
+
+def _sl_assign_x(
+    order: dict[int, list[int]],
+    layer_ids: list[int],
+    dsucc: list[set[int]],
+    dpred: list[set[int]],
+    scc_file: list[str],
+    sw: list[float],
+    node_gap: float,
+) -> dict[int, float]:
+    """X with soft file-affinity. Order is FIXED (preserves crossing reduction);
+    only x positions move, with a per-pair width-aware min-gap so boxes never
+    overlap (gap = half left width + half right width + clear padding)."""
+    def min_gap(a: int, b: int) -> float:
+        return sw[a] / 2.0 + sw[b] / 2.0 + _SL_PAD_X
+
+    x: dict[int, float] = {}
+    for L in layer_ids:
+        row = order[L]
+        cx = 0.0
+        for idx, i in enumerate(row):
+            if idx > 0:
+                cx += min_gap(row[idx - 1], i)
+            x[i] = cx
+        if row:
+            mid = (x[row[0]] + x[row[-1]]) / 2.0
+            for i in row:
+                x[i] -= mid
+
+    for _ in range(_SL_X_COMPACT_PASSES):
+        for L in layer_ids:
+            row = order[L]
+            k = len(row)
+            if not k:
+                continue
+            same_by_file: dict[str, list[float]] = defaultdict(list)
+            for i in row:
+                same_by_file[scc_file[i]].append(x[i])
+            targets: list[float] = []
+            for idx, i in enumerate(row):
+                nb = list(dpred[i]) + list(dsucc[i])
+                nb_x = [x[v] for v in nb if v in x]
+                nmed = _sl_median(nb_x) if nb_x else x[i]
+                smed = _sl_median(same_by_file[scc_file[i]])
+                src_bias = (idx - (k - 1) / 2.0) * node_gap
+                targets.append(0.70 * nmed + 0.25 * smed + 0.05 * src_bias)
+            # Left-to-right width-aware min-gap enforcement in the fixed order.
+            for j in range(1, k):
+                floor = targets[j - 1] + min_gap(row[j - 1], row[j])
+                if targets[j] < floor:
+                    targets[j] = floor
+            for j, i in enumerate(row):
+                x[i] = targets[j]
+            mid = (x[row[0]] + x[row[-1]]) / 2.0
+            for i in row:
+                x[i] -= mid
+    return x
+
+
+def _sl_layout_component(
+    comp_nodes: list[str],
+    successors: dict[str, set[str]],
+    name_of: dict[str, str],
+    file_of: dict[str, str],
+    line_of: dict[str, int],
+    node_sizes: dict[str, tuple[float, float]],
+    layer_gap: float,
+    node_gap: float,
+    sweeps: int,
+) -> tuple[dict[str, tuple[float, float]], bool, int]:
+    """Lay out one weak component. Returns (local_positions, has_root, scc_count).
+
+    Size-aware: every node reserves its true box footprint so nothing overlaps.
+    Wide layers are wrapped into stacked sub-rows so large graphs read as a
+    rectangle (not a downward triangle) with a much smaller horizontal span."""
+    sccs, node_to_scc = _sl_tarjan_scc(comp_nodes, successors)
+    dsucc, dpred = _sl_condense(sccs, node_to_scc, comp_nodes, successors)
+    scc_file = _sl_scc_file(sccs, file_of)
+    roots = _sl_select_roots(sccs, dsucc, dpred, scc_file, name_of, file_of)
+    layer = _sl_assign_layers(len(sccs), dsucc, dpred, roots)
+
+    def tie_key(i: int) -> tuple:
+        members = sccs[i]
+        m0 = min(members)
+        return (scc_file[i], min(line_of.get(m, 0) for m in members),
+                min(name_of.get(m, "") for m in members), m0)
+
+    order, layer_ids = _sl_order_layers(
+        layer, len(sccs), dsucc, dpred, tie_key, sweeps
+    )
+    sw, sh, offsets = _sl_supernode_geometry(sccs, node_sizes, name_of, line_of)
+    xs = _sl_assign_x(order, layer_ids, dsucc, dpred, scc_file, sw, node_gap)
+
+    # --- Rectangle shaping: wrap wide layers into stacked sub-rows ------- #
+    widest = (max(sw) if sw else 0.0) + _SL_PAD_X
+
+    def split_rows(row: list[int], target_w: float) -> list[list[int]]:
+        subrows: list[list[int]] = []
+        cur: list[int] = []
+        cur_w = 0.0
+        for i in row:
+            add = sw[i] + (_SL_PAD_X if cur else 0.0)
+            if cur and cur_w + add > target_w:
+                subrows.append(cur)
+                cur, cur_w, add = [], 0.0, sw[i]
+            cur.append(i)
+            cur_w += add
+        if cur:
+            subrows.append(cur)
+        return subrows
+
+    def total_height(target_w: float) -> float:
+        h = 0.0
+        for li, L in enumerate(layer_ids):
+            rws = split_rows(order[L], target_w)
+            for si, sr in enumerate(rws):
+                h += max(sh[i] for i in sr)
+                if si < len(rws) - 1:
+                    h += _SL_ROW_GAP_Y
+            if li < len(layer_ids) - 1:
+                h += layer_gap
+        return h
+
+    # Two fixed-point iterations toward the target aspect ratio (deterministic).
+    natural_w = 0.0
+    for L in layer_ids:
+        roww = sum(sw[i] for i in order[L]) + _SL_PAD_X * max(0, len(order[L]) - 1)
+        natural_w = max(natural_w, roww)
+    target_w = natural_w
+    for _ in range(2):
+        h = total_height(target_w)
+        target_w = max(widest, _SL_TARGET_ASPECT * h)
+
+    # --- Place nodes: width-aware x per sub-row, cumulative height-aware y - #
+    local: dict[str, tuple[float, float]] = {}
+    y_cursor = 0.0
+    for li, L in enumerate(layer_ids):
+        rws = split_rows(order[L], target_w)
+        single = len(rws) == 1
+        for si, sr in enumerate(rws):
+            row_h = max(sh[i] for i in sr)
+            cy = y_cursor + row_h / 2.0
+            if single:
+                # Keep the crossing-aligned x positions from _sl_assign_x.
+                row_x = {i: xs[i] for i in sr}
+            else:
+                # Re-pack this sub-row left-to-right, width-aware, centred.
+                row_x = {}
+                cx = 0.0
+                prev = None
+                for i in sr:
+                    if prev is not None:
+                        cx += sw[prev] / 2.0 + sw[i] / 2.0 + _SL_PAD_X
+                    row_x[i] = cx
+                    prev = i
+                mid = (row_x[sr[0]] + row_x[sr[-1]]) / 2.0
+                for i in sr:
+                    row_x[i] -= mid
+            for i in sr:
+                bx, by = row_x[i], cy
+                for m, (ox, oy) in offsets[i].items():
+                    local[m] = (bx + ox, by + oy)
+            y_cursor += row_h
+            if si < len(rws) - 1:
+                y_cursor += _SL_ROW_GAP_Y
+        if li < len(layer_ids) - 1:
+            y_cursor += layer_gap
+
+    return local, bool(roots), len(sccs)
+
+
+def _sl_pack_components(
+    comp_results: list[tuple[dict[str, tuple[float, float]], bool, list[str]]],
+    successors: dict[str, set[str]],
+    file_of: dict[str, str],
+) -> dict[str, tuple[float, float]]:
+    """Importance-sort components and shelf-pack them in 2D (no single long row)."""
+    items = []
+    for local, has_root, comp_nodes in comp_results:
+        comp_set = set(comp_nodes)
+        edge_count = 0
+        cross_file = 0
+        for u in comp_nodes:
+            for v in successors.get(u, ()):
+                if v in comp_set:
+                    edge_count += 1
+                    if file_of.get(u) != file_of.get(v):
+                        cross_file += 1
+        xs = [p[0] for p in local.values()]
+        ys = [p[1] for p in local.values()]
+        min_x, max_x = (min(xs), max(xs)) if xs else (0.0, 0.0)
+        min_y, max_y = (min(ys), max(ys)) if ys else (0.0, 0.0)
+        width = max_x - min_x
+        height = max_y - min_y
+        importance = (1 if has_root else 0, edge_count, len(comp_nodes), cross_file)
+        items.append({
+            "local": local, "min_x": min_x, "min_y": min_y,
+            "width": width, "height": height, "importance": importance,
+            "key": min(comp_nodes) if comp_nodes else "",
+        })
+
+    items.sort(key=lambda it: (tuple(-v for v in it["importance"]), it["key"]))
+
+    final: dict[str, tuple[float, float]] = {}
+    cursor_x = 0.0
+    row_y = 0.0
+    row_height = 0.0
+    for it in items:
+        if cursor_x > 0.0 and cursor_x + it["width"] > _SL_MAX_PACKING_ROW_WIDTH:
+            row_y += row_height + _SL_COMPONENT_MARGIN_Y
+            cursor_x = 0.0
+            row_height = 0.0
+        off_x = cursor_x - it["min_x"]
+        off_y = row_y - it["min_y"]
+        for nid, (px, py) in it["local"].items():
+            final[nid] = (px + off_x, py + off_y)
+        cursor_x += it["width"] + _SL_COMPONENT_MARGIN_X
+        row_height = max(row_height, it["height"])
+    return final
+
+
+def _sl_diagnostics(stats: dict) -> None:
+    """Optional layout diagnostics (off by default; CG_LAYOUT_DEBUG=1 to enable)."""
+    import os
+    import sys
+    if not os.environ.get("CG_LAYOUT_DEBUG"):
+        return
+    sys.stderr.write(
+        "[cg-layout] " + "  ".join(f"{k}={v}" for k, v in stats.items()) + "\n"
+    )
+
 
 def _compute_layout(
     graph: CallGraph,
     h_sep: int = 420,
     v_sep: int = 340,
+    node_sizes: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, tuple[float, float]]:
     """
-    1. Find weakly-connected components.
-    2. Sort components by (dominant language, descending size).
-    3. Lay each component out using BFS hierarchical positioning.
-    4. Pack components into rows, starting a new row when language changes
-       or the row would exceed MAX_ROW_W.
+    Smart top-down call-graph layout.
+
+    A deterministic Sugiyama-style layered layout for the Function-mode initial
+    placement. The graph is split into weakly-connected components laid out
+    independently; within each component cycles are collapsed via SCC
+    condensation, real architectural roots are selected (not every no-caller
+    node), vertical layers are assigned by longest path (callers above callees),
+    edge crossings are reduced with barycenter sweeps, and x positions blend
+    connected-neighbour position (0.70), same-file affinity (0.25) and source
+    order (0.05) — so same-file functions stay *usually* near without forming
+    rigid lanes. Components are importance-ranked and shelf-packed in 2D to keep
+    the canvas compact. Returns {node_id: (x, y)}.
     """
     all_nodes = set(graph.functions.keys())
     if not all_nodes:
@@ -116,144 +1006,66 @@ def _compute_layout(
 
     successors: dict[str, set[str]] = defaultdict(set)
     predecessors: dict[str, set[str]] = defaultdict(set)
-    undirected: dict[str, set[str]] = defaultdict(set)
-
+    edge_total = 0
     for call in graph.calls:
         c, e = call.caller_id, call.callee_id
         if e and e in all_nodes and c in all_nodes and c != e:
+            if e not in successors[c]:
+                edge_total += 1
             successors[c].add(e)
             predecessors[e].add(c)
-            undirected[c].add(e)
-            undirected[e].add(c)
 
-    # ── Find weakly-connected components ──
-    visited: set[str] = set()
-    components: list[list[str]] = []
-    for start in sorted(all_nodes):
-        if start in visited:
-            continue
-        comp: list[str] = []
-        q: deque[str] = deque([start])
-        while q:
-            n = q.popleft()
-            if n in visited:
-                continue
-            visited.add(n)
-            comp.append(n)
-            for nb in undirected.get(n, set()):
-                if nb not in visited:
-                    q.append(nb)
-        components.append(comp)
+    name_of: dict[str, str] = {}
+    file_of: dict[str, str] = {}
+    line_of: dict[str, int] = {}
+    for n in all_nodes:
+        fn = graph.functions.get(n)
+        name_of[n] = fn.name if fn is not None else n
+        file_of[n] = (fn.file_path if (fn is not None and fn.file_path) else "")
+        line_of[n] = (fn.line_start if (fn is not None and fn.line_start) else 0)
 
-    def dom_lang(comp: list[str]) -> Language:
-        langs = [graph.functions[n].language for n in comp if n in graph.functions]
-        return max(set(langs), key=langs.count) if langs else Language.PYTHON
+    # Real box footprints drive spacing so nothing overlaps. Callers may pass
+    # the actual rendered-label sizes; otherwise estimate from the node name.
+    if node_sizes is None:
+        node_sizes = {n: _sl_estimate_size(name_of[n]) for n in all_nodes}
+    else:
+        node_sizes = {n: node_sizes.get(n) or _sl_estimate_size(name_of[n])
+                      for n in all_nodes}
 
-    components.sort(key=lambda c: (_LANG_ORDER.get(dom_lang(c), 99), -len(c)))
+    layer_gap = float(v_sep)
+    node_gap = float(h_sep) * 0.6
+    sweeps = _sl_sweeps_for(len(all_nodes))
 
-    # ── Lay out one component ──
-    def _layout_one(comp: list[str]) -> dict[str, tuple[float, float]]:
-        comp_set = set(comp)
-        roots = [n for n in comp if not predecessors.get(n)]
-        if not roots:
-            roots = [comp[0]]
+    components = _sl_weak_components(all_nodes, successors, predecessors)
 
-        # Longest-path BFS with a relax-budget. We keep extending levels when a
-        # longer route is found, but cap the total visits per node so cyclic
-        # call graphs (e.g. module-level aggregation where Drivers <-> UI
-        # creates a 2-cycle) cannot livelock the layout. `len(comp_set) + 1`
-        # is enough to assign each node its longest distance from any root
-        # even if every node is revisited once per other node in the worst case.
-        level: dict[str, int] = {}
-        visit_count: dict[str, int] = defaultdict(int)
-        max_visits = len(comp_set) + 1
+    comp_results: list[tuple[dict[str, tuple[float, float]], bool, list[str]]] = []
+    scc_total = 0
+    for comp_nodes in components:
+        local, has_root, scc_count = _sl_layout_component(
+            comp_nodes, successors, name_of, file_of, line_of, node_sizes,
+            layer_gap, node_gap, sweeps,
+        )
+        scc_total += scc_count
+        comp_results.append((local, has_root, comp_nodes))
 
-        q2: deque[str] = deque()
-        for r in sorted(roots):
-            if r not in level:
-                level[r] = 0
-                q2.append(r)
+    final = _sl_pack_components(comp_results, successors, file_of)
 
-        while q2:
-            nd = q2.popleft()
-            for s in sorted(successors.get(nd, set())):
-                if s not in comp_set:
-                    continue
-                new_lvl = level[nd] + 1
-                if s not in level or level[s] < new_lvl:
-                    if visit_count[s] >= max_visits:
-                        continue   # cycle guard
-                    visit_count[s] += 1
-                    level[s] = new_lvl
-                    q2.append(s)
-
-        max_lvl = max(level.values(), default=0)
-        for n in comp:
-            if n not in level:
-                level[n] = max_lvl + 1
-
-        by_lvl: dict[int, list[str]] = defaultdict(list)
-        for n, lvl in level.items():
-            by_lvl[lvl].append(n)
-
-        pos: dict[str, tuple[float, float]] = {}
-        for lvl in sorted(by_lvl.keys()):
-            nodes_here = by_lvl[lvl]
-            if lvl > 0:
-                def _px(n: str) -> float:
-                    preds = [p for p in predecessors.get(n, set()) if p in pos and p in comp_set]
-                    return sum(pos[p][0] for p in preds) / len(preds) if preds else 0.0
-                nodes_here = sorted(nodes_here, key=_px)
-            count = len(nodes_here)
-            total_w = (count - 1) * h_sep
-            for i, n in enumerate(nodes_here):
-                pos[n] = (float(i * h_sep - total_w / 2), float(lvl * v_sep))
-        return pos
-
-    # ── Pack components into a global canvas ──
-    H_COMP_GAP = 600   # gap between components of the same language
-    V_LANG_GAP = 700   # extra vertical gap between language groups
-    V_COMP_GAP = 500   # vertical gap for row-wrap within same language
-    PAD = 100           # padding added around each component bounding box
-    MAX_ROW_W = 6000
-
-    final: dict[str, tuple[float, float]] = {}
-    curr_x = 0.0
-    curr_y = 0.0
-    row_h = 0.0
-    prev_lang: Optional[Language] = None
-
-    for comp in components:
-        local_pos = _layout_one(comp)
-        if not local_pos:
-            continue
-
-        xs = [p[0] for p in local_pos.values()]
-        ys = [p[1] for p in local_pos.values()]
-        mn_x, mx_x = min(xs), max(xs)
-        mn_y, mx_y = min(ys), max(ys)
-        comp_w = mx_x - mn_x + h_sep
-        comp_h = mx_y - mn_y + v_sep
-
-        cl = dom_lang(comp)
-
-        if prev_lang is not None and cl != prev_lang:
-            curr_y += row_h + V_LANG_GAP
-            curr_x = 0.0
-            row_h = 0.0
-        elif curr_x > 0 and curr_x + comp_w + PAD > MAX_ROW_W:
-            curr_y += row_h + V_COMP_GAP
-            curr_x = 0.0
-            row_h = 0.0
-
-        off_x = curr_x - mn_x + PAD
-        off_y = curr_y - mn_y + PAD
-        for nid, (lx, ly) in local_pos.items():
-            final[nid] = (lx + off_x, ly + off_y)
-
-        curr_x += comp_w + H_COMP_GAP
-        row_h = max(row_h, comp_h + 2 * PAD)
-        prev_lang = cl
+    # Center the whole canvas horizontally (matches prior behaviour).
+    if final:
+        xs = [p[0] for p in final.values()]
+        ys = [p[1] for p in final.values()]
+        mid = (min(xs) + max(xs)) / 2.0
+        for n in list(final.keys()):
+            px, py = final[n]
+            final[n] = (px - mid, py)
+        _sl_diagnostics({
+            "nodes": len(all_nodes), "edges": edge_total,
+            "weak_components": len(components),
+            "largest_component": (max(len(c) for c in components) if components else 0),
+            "sccs": scc_total, "sweeps": sweeps,
+            "canvas_w": round(max(xs) - min(xs), 1),
+            "canvas_h": round(max(ys) - min(ys), 1),
+        })
 
     return final
 
@@ -429,6 +1241,22 @@ def _build_var_flow_data(graph: "CallGraph") -> dict:
             sc = (var.scope or "").lower()
             kind = sk if sk in _SCOPE_KINDS else sc
 
+            # VFI-9: member-level variable identity. A plain member read
+            # (`cfg.speed`) is recorded by the parser with name=leaf (`speed`)
+            # and parent_name=`cfg`. Bucketing it under the bare leaf merges
+            # unrelated members (`cfg.speed` + `engine.speed`) into one phantom
+            # flow AND severs it from the full-path-keyed custom-input/connect
+            # destinations (`lugasi(&cfg.speed, …)` is recorded under `cfg.speed`).
+            # Re-key member reads by their full `parent.member` path so each
+            # member is a distinct end-to-end identity that lines up with the
+            # interprocedural arg/full-name matching (VFI-2) and with the
+            # custom-input destinations carrying the same path.
+            _mem_parent = getattr(var, "parent_name", "") or ""
+            _is_member_read = (sk == "member_access" and bool(_mem_parent))
+            if _is_member_read:
+                name = _mem_parent + "." + name
+                norm = name.lower()
+
             if sk == "member_access":
                 action = "member_access"
             elif kind == "constant":
@@ -451,11 +1279,12 @@ def _build_var_flow_data(graph: "CallGraph") -> dict:
             _custom_func       = getattr(var, "custom_input_func", "") or ""
             # sort_priority: 0=custom_input (highest), 1=connect, 2=everything else
             _sort_pri = 0 if sk == "custom_input" else (1 if sk == "input_file_connect" else 2)
+            _cat = _category(sc, kind)
             # Build the record dict, dropping empty/default fields to shrink JSON payload
             # (significant on large .sln projects where this can be 150K+ occurrences).
             _rec = {
                 "name": name,
-                "category": _category(sc, kind),
+                "category": _cat,
                 "data_type": var.type_hint or "unknown",
                 "file_path": fp,
                 "file_name": Path(fp).name if fp else "",
@@ -472,9 +1301,24 @@ def _build_var_flow_data(graph: "CallGraph") -> dict:
             if var.type_hint:                  _rec["type_hint"] = var.type_hint
             _val = (var.value or "")[:120]
             if _val:                            _rec["value"] = _val
+            # Full source statement line for the SOURCE row + modal (e.g. "x = fn(a);")
+            _fsrc = (getattr(var, "full_source", "") or "")[:200]
+            if _fsrc:                           _rec["full_source"] = _fsrc
             if getattr(var, "is_dead", False): _rec["is_dead"] = True
             _dr = getattr(var, "dead_reason", "") or ""
             if _dr:                             _rec["dead_reason"] = _dr
+            _dcat = getattr(var, "dead_category", "") or ""
+            if _dcat:                           _rec["dead_category"] = _dcat
+            _dconf = getattr(var, "dead_confidence", "") or ""
+            if _dconf:                          _rec["dead_confidence"] = _dconf
+            _drl = getattr(var, "read_lines", None) or []
+            _dwl = getattr(var, "write_lines", None) or []
+            if _drl:                            _rec["read_lines"] = list(_drl)[:20]
+            if _dwl:                            _rec["write_lines"] = list(_dwl)[:20]
+            if getattr(var, "is_suppressed", False):
+                _rec["is_suppressed"] = True
+                _sr = getattr(var, "suppress_reason", "") or ""
+                if _sr:                         _rec["suppress_reason"] = _sr
             _cp = getattr(var, "connect_path", "") or ""
             if _cp:                             _rec["connect_path"] = _cp
             _cin = getattr(var, "connect_input_name", "") or ""
@@ -483,6 +1327,31 @@ def _build_var_flow_data(graph: "CallGraph") -> dict:
             if _custom_classifier:              _rec["custom_input_classifier"] = _custom_classifier
             _parent = getattr(var, "parent_name", "") or ""
             if _parent:                         _rec["parent_name"] = _parent
+            # VFI-3: cross-variable assignment source
+            _asrc = getattr(var, "assign_src", "") or ""
+            if _asrc:                           _rec["assign_src"] = _asrc.lower()
+            # VF-10: adjacent intent comment (above or inline right-side)
+            _dc = getattr(var, "doc_comment", "") or ""
+            if _dc:                             _rec["doc_comment"] = _dc[:200]
+            # VFI-1: scope identity for "split by scope" grouping.Function-scoped
+            # vars (local / heap) and parameters default to function_id on the
+            # consumer side, so only emit scope_id for genuinely broader scopes:
+            # globals share program scope, statics/consts share file scope, struct
+            # members share their type scope.
+            # VFI-9: member identities (reads and full-path custom-input/connect
+            # destinations) carry an "m:<full.path>" scope id so "split by scope"
+            # keeps `cfg.speed` and `engine.speed` apart yet merges every read of
+            # the same member across the functions that touch it.
+            if _is_member_read:
+                _rec["scope_id"] = "m:" + norm
+            elif _mem_parent and "." in name:
+                _rec["scope_id"] = "m:" + name.lower()
+            elif _cat in ("global", "env"):
+                _rec["scope_id"] = "global"
+            elif _cat in ("static", "const"):
+                _rec["scope_id"] = "f:" + fp
+            elif _cat == "member":
+                _rec["scope_id"] = "t:" + (var.type_hint or "")
             result[norm].append(_rec)
 
             # NOTE: We deliberately do NOT create a synthetic "input_source" upstream block
@@ -628,6 +1497,7 @@ body { display: flex !important; flex-direction: row !important; }
 .hp-lang-matlab  { background:#3a1a4a; color:#BB8FCE; }
 .hp-lang-ext     { background:#2a2a2a; color:#BDC3C7; }
 .hp-ftype        { background:#2a2e38; color:#99aabb; }
+.hp-virtual      { background:#3a2e1a; color:#f0c674; }
 .hp-name  { font-size: 13px; font-weight: 700; color: #74B3F7; margin-bottom: 6px; word-break: break-all; }
 .hp-doc   { font-style: italic; font-size: 11px; color: #8da0b0; margin-bottom: 6px; line-height: 1.35; }
 .hp-row   { display: flex; gap: 5px; margin-bottom: 2px; font-size: 11px; }
@@ -794,7 +1664,18 @@ body > .card {
 .cg-cb-cross:hover { background: #3a2a0a; }
 .cg-fn-meta { font-size: 10px; color: #5a6a7a; margin-top: 3px; }
 
-/* ── Variable Flow view ── */
+/* ── Root / Entry-Point badges ── */
+.cg-root-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; font-weight: 700; border-radius: 4px; padding: 1px 6px;
+  white-space: nowrap; flex-shrink: 0; letter-spacing: 0.2px; cursor: default;
+  pointer-events: none;
+}
+.cg-root-badge.rank-1 { background: rgba(255,215,0,0.18); color: #FFD700; border: 1px solid rgba(255,215,0,0.45); }
+.cg-root-badge.rank-2 { background: rgba(192,192,192,0.18); color: #C0C0C0; border: 1px solid rgba(192,192,192,0.45); }
+.cg-root-badge.rank-3 { background: rgba(205,127,50,0.18); color: #CD7F32; border: 1px solid rgba(205,127,50,0.45); }
+
+
 #cg-varflow-view {
   display: none; flex: 1; height: 100vh;
   flex-direction: column; overflow: hidden;
@@ -837,6 +1718,11 @@ body > .card {
 .cg-vf-dd-item:hover { background: #1e3050; }
 .cg-vf-dd-name { font-family: monospace; font-weight: 600; }
 .cg-vf-dd-mark { color: #569cd6; }
+/* VF-8: hotspot fire badge in dropdown */
+.cg-vf-hot-badge {
+  font-size: 12px; margin-right: 5px; flex-shrink: 0;
+  filter: drop-shadow(0 0 3px rgba(255,140,0,0.7));
+}
 .cg-vf-dd-count {
   margin-left: auto; font-size: 10px; color: #6a7a8a;
   background: #1a1d23; padding: 1px 7px; border-radius: 8px; flex-shrink: 0;
@@ -915,11 +1801,26 @@ body > .card {
   border-top: 1px solid #2a2f38; font-family: Consolas, monospace;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* VF-10: inline "why" doc-comment chip */
+.cg-vf-doc-chip {
+  font-size: 10px; color: #b4c9a0; background: #121a0f; padding: 4px 9px 5px;
+  border-top: 1px solid #1e2d1a; font-style: italic;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* SOURCE row — monospace code line, wraps so full line is visible */
+.cg-vf-source-row { align-items: flex-start; }
+.cg-vf-source-val {
+  font-family: Consolas, monospace; font-size: 10px; color: #9cdcfe;
+  white-space: pre-wrap; word-break: break-all; line-height: 1.4;
+  border-left: 2px solid #3a4a6a; padding-left: 5px; margin-top: 1px;
+}
 /* edges — blue palette matching Function/Script mode */
 .cg-vf-edge       { stroke: #6c8ebf; stroke-width: 2;   fill: none; opacity: 0.85; }
 .cg-vf-edge-call  { /* inherits */ }
 .cg-vf-edge-chain { /* inherits */ }
 .cg-vf-edge-same  { stroke-dasharray: 5,4; stroke-width: 1.5; opacity: 0.65; }
+/* VFI-3: cross-variable assignment edge — dashed orange */
+.cg-vf-edge-assign { stroke: #e67e22; stroke-dasharray: 6,4; stroke-width: 1.8; opacity: 0.85; }
 /* selected edge turns yellow (matches Function-mode edge-click highlight) */
 .cg-vf-edge.vf-edge-selected { stroke: #F7D774; stroke-width: 3.5; opacity: 1; }
 .cg-vf-var-orig { font-size:10px; color:#8899aa; margin-left:3px; font-style:italic; }
@@ -999,6 +1900,21 @@ body > .card {
   background: #4a1010; color: #e74c3c; border: 1px solid #7a1a1a;
   margin-left: 4px;
 }
+/* category-specific dead badges (Variable Flow) */
+.cg-vf-dead-badge.dv-unused      { background:#4a1010; color:#e74c3c; border-color:#7a1a1a; }
+.cg-vf-dead-badge.dv-dead_store  { background:#4a3410; color:#e6a23c; border-color:#7a5a1a; }
+.cg-vf-dead-badge.dv-unused_param{ background:#3a1040; color:#c678dd; border-color:#5a1a6a; }
+.cg-vf-dead-badge.dv-dead_alloc  { background:#102a3a; color:#5fb0d8; border-color:#1a4a5a; }
+.cg-vf-dead-badge.dv-unused_value{ background:#13332a; color:#4ec99a; border-color:#1a5a44; }
+.cg-vf-dead-badge.dv-suppressed  { background:#222831; color:#8a97a8; border-color:#39414d; }
+.cg-vf-dead-badge .dv-conf {
+  font-size: 8px; opacity: 0.8; margin-left: 3px; font-weight: 600;
+}
+.cg-vf-dead-badge.dv-lowconf { opacity: 0.92; }
+.cg-vf-dead-badge.dv-lowconf::after {
+  content: "≈"; margin-left: 3px; font-weight: 700;
+}
+.cg-vf-node.cg-vf-suppressed { border: 1px dashed #5a6675 !important; opacity: 0.85; }
 /* .connect() receiver node — purple border */
 .cg-vf-node.cg-vf-connect-input {
   border: 2px solid #9b59b6 !important;
@@ -1057,11 +1973,25 @@ body > .card {
 .cg-vf-annot {
   position: absolute; border: 2px solid rgba(70, 200, 100, 0.85);
   background: rgba(70, 200, 100, 0.25); border-radius: 4px;
-  pointer-events: all; cursor: move; z-index: 1;
+  pointer-events: none; cursor: default; z-index: 1;
   min-width: 80px; min-height: 40px;
 }
+/* grip/del/resize always interactive even though body is click-through */
+.annot-mode-active .cg-vf-annot { pointer-events: all; cursor: move; }
+.cg-vf-annot-grip {
+  position: absolute; top: 0; left: 0; width: 18px; height: 18px;
+  cursor: move; pointer-events: all; z-index: 3;
+  background: rgba(70,200,100,0.55); border-radius: 3px 0 4px 0;
+}
+.cg-vf-annot-grip::before {
+  content: ''; position: absolute; top: 4px; left: 4px; width: 8px; height: 8px;
+  background:
+    linear-gradient(rgba(255,255,255,0.85) 0 0) 0 0/8px 1.5px no-repeat,
+    linear-gradient(rgba(255,255,255,0.85) 0 0) 0 3px/8px 1.5px no-repeat,
+    linear-gradient(rgba(255,255,255,0.85) 0 0) 0 6px/8px 1.5px no-repeat;
+}
 .cg-vf-annot-label {
-  position: absolute; top: 6px; left: 9px; right: 28px;
+  position: absolute; top: 6px; left: 22px; right: 28px;
   font-size: 16px; color: rgba(120, 240, 140, 0.9);
   pointer-events: none; white-space: pre-wrap; word-break: break-word;
   text-shadow: 0 1px 3px rgba(0,0,0,0.8); line-height: 1.3;
@@ -1079,11 +2009,13 @@ body > .card {
   position: absolute; top: 2px; right: 4px;
   font-size: 12px; color: rgba(200,200,200,0.5); cursor: pointer;
   background: none; border: none; line-height: 1; padding: 2px;
+  pointer-events: all;
 }
 .cg-vf-annot-del:hover { color: #e74c3c; }
 .cg-vf-annot-resize {
   position: absolute; bottom: 0; right: 0; width: 14px; height: 14px;
   cursor: se-resize; background: rgba(70,200,100,0.25); border-radius: 0 0 3px 0;
+  pointer-events: all;
 }
 /* Dead vars panel button */
 #cg-vf-dead-btn {
@@ -1101,6 +2033,96 @@ body > .card {
 }
 #cg-vf-annot-btn.active { background: #0e2a18; border-color: #4ec980; }
 #cg-vf-annot-btn:hover { background: #112010; }
+/* Split-by-scope toggle button (VFI-1) */
+#cg-vf-scope-btn {
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  border: 1px solid #3d4451; background: #1a1d23; color: #6cb6ff;
+  border-radius: 4px; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+#cg-vf-scope-btn.active { background: #102132; border-color: #4A90D9; }
+#cg-vf-scope-btn:hover { background: #14202e; }
+/* Flow-direction toggle button (VFI-7) */
+#cg-vf-backward-btn {
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  border: 1px solid #3d4451; background: #1a1d23; color: #d8a657;
+  border-radius: 4px; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+#cg-vf-backward-btn.active { background: #2a1f0e; border-color: #e0a458; }
+#cg-vf-backward-btn:hover { background: #221a10; }
+/* VF-6: Highlight-direction toggle button */
+#cg-vf-hldir-btn {
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  border: 1px solid #3d4451; background: #1a1d23; color: #a78bfa;
+  border-radius: 4px; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+#cg-vf-hldir-btn.active { background: #1e1631; border-color: #7c3aed; }
+#cg-vf-hldir-btn:hover { background: #18122a; }
+/* Cross-mode flow-trace control: [☑ trace] [⇟ Downstream] */
+.cg-trace-ctl {
+  display: inline-flex; align-items: center; gap: 6px;
+  vertical-align: middle; white-space: nowrap;
+}
+.cg-trace-ctl .cg-trace-cb-lbl {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 600; color: #a78bfa; cursor: pointer;
+  user-select: none;
+}
+.cg-trace-ctl .cg-trace-cb-lbl input { cursor: pointer; margin: 0; }
+.cg-trace-ctl .cg-trace-dir-btn {
+  padding: 4px 10px; font-size: 11px; font-weight: 600;
+  border: 1px solid #3d4451; background: #1a1d23; color: #a78bfa;
+  border-radius: 4px; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+.cg-trace-ctl .cg-trace-dir-btn.active { background: #1e1631; border-color: #7c3aed; }
+.cg-trace-ctl .cg-trace-dir-btn:hover { background: #18122a; }
+/* Function-mode floating overlay control (no per-mode toolbar exists). */
+#cg-fn-trace-ctl {
+  position: absolute; top: 10px; left: 10px; z-index: 60;
+  background: rgba(20,23,30,0.92); border: 1px solid #3d4451;
+  border-radius: 6px; padding: 6px 9px; backdrop-filter: blur(3px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+/* Shared trace styling for custom-DOM modes (script/module/include tiles). */
+.cg-trace-dim { opacity: 0.25 !important; transition: opacity .15s; }
+.cg-trace-lit { transition: border-color .15s, box-shadow .15s; }
+.cg-trace-merge { border-style: dashed !important; }
+/* VF mode: enable checkbox sits to the left of the direction button. */
+#cg-vf-trace-cb-lbl {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 600; color: #a78bfa; cursor: pointer;
+  user-select: none; white-space: nowrap; flex-shrink: 0;
+}
+#cg-vf-trace-cb-lbl input { cursor: pointer; margin: 0; }
+#cg-vf-family-row {
+  display: flex; align-items: center; gap: 6px; padding: 4px 0 2px 0;
+  flex-wrap: wrap;
+}
+#cg-vf-family-row .cg-vf-fam-label {
+  font-size: 10px; color: #5a6a7a; text-transform: uppercase; letter-spacing: 0.6px; margin-right: 2px;
+}
+.cg-vf-fam-btn {
+  padding: 2px 9px; font-size: 11px; border-radius: 12px; cursor: pointer;
+  border: 1px solid #3d4451; background: #23272f; color: #8899aa;
+  white-space: nowrap; flex-shrink: 0; transition: opacity 0.15s;
+}
+.cg-vf-fam-btn.active { color: #e2e8f0; border-color: #6e8fa8; background: #1a2535; }
+.cg-vf-fam-btn[data-fam="lugasi"].active { border-color: #e0a458; color: #e0a458; background: #1f1808; }
+.cg-vf-fam-btn[data-fam="connect"].active { border-color: #4fc3f7; color: #4fc3f7; background: #08171f; }
+.cg-vf-fam-btn[data-fam="member"].active { border-color: #a78bfa; color: #a78bfa; background: #170f2a; }
+.cg-vf-fam-btn[data-fam="variable"].active { border-color: #4ec980; color: #4ec980; background: #0a1f14; }
+/* VF-4: separator + "show all family flow" action buttons */
+.cg-vf-fam-sep { width: 1px; height: 16px; background: #3d4451; margin: 0 4px; flex-shrink: 0; }
+.cg-vf-fam-show-btn {
+  padding: 2px 10px; font-size: 11px; font-weight: 600; border-radius: 12px; cursor: pointer;
+  border: 1px solid #3d4451; background: #23272f; color: #c8d4e0;
+  white-space: nowrap; flex-shrink: 0;
+}
+.cg-vf-fam-show-btn:hover { background: #2a3340; border-color: #6e8fa8; }
+.cg-vf-fam-show-btn.active { border-color: #4A90D9; background: #102132; color: #e2e8f0; }
+.cg-vf-fam-show-btn[data-fam="lugasi"]:hover { border-color: #e0a458; }
+.cg-vf-fam-show-btn[data-fam="lugasi"].active { border-color: #e0a458; color: #e0a458; background: #1f1808; }
+.cg-vf-fam-show-btn[data-fam="connect"]:hover { border-color: #4fc3f7; }
+.cg-vf-fam-show-btn[data-fam="connect"].active { border-color: #4fc3f7; color: #4fc3f7; background: #08171f; }
 /* Annotation color-picker modal */
 #cg-annot-picker {
   display: none; position: fixed; top: 40%; left: 50%;
@@ -1205,7 +2227,19 @@ body > .card {
 .cg-dead-fn   { color: #9ab0c0; }
 .cg-dead-line { color: #6a7a8a; text-align: right; }
 .cg-dead-type { color: #c586c0; }
-.cg-dead-why  { color: #e74c3c; font-size: 10px; }
+.cg-dead-why  { color: #8a97a8; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cg-dead-cat-hdr {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px 2px; margin-top: 4px;
+}
+.cg-dead-cat-n {
+  font-size: 10px; color: #6a7a8a; font-weight: 700;
+  background: #1e2530; border-radius: 8px; padding: 0 7px;
+}
+.cg-dead-conf { font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.cg-dead-conf-high   { color: #e06c5a; }
+.cg-dead-conf-medium { color: #e6a23c; }
+.cg-dead-conf-low    { color: #8a97a8; }
 
 /* ── Main search dropdown (function / script modes) ── */
 #cg-search-wrap { position: relative; }
@@ -1277,6 +2311,7 @@ body[data-theme="light"] .hp-lang-cpp { background:#f0fdf4; color:#15803d; }
 body[data-theme="light"] .hp-lang-matlab { background:#faf5ff; color:#7e22ce; }
 body[data-theme="light"] .hp-lang-ext { background:#f1f5f9; color:#64748b; }
 body[data-theme="light"] .hp-ftype { background:#f1f5f9; color:#64748b; }
+body[data-theme="light"] .hp-virtual { background:#fef3c7; color:#b45309; }
 /* Detail panel */
 body[data-theme="light"] #cg-detail { background: #f4f7fa; border-left-color: #c8d4de; color: #1a2535; }
 body[data-theme="light"] #cg-detail-close { color: #7a8898; }
@@ -1357,6 +2392,8 @@ body[data-theme="light"] .cg-vf-fn-val { color: #7a8898; }
 body[data-theme="light"] .cg-vf-file-val { color: #9eb4c8; }
 body[data-theme="light"] .cg-vf-type-val { color: #1d4ed8; }
 body[data-theme="light"] .cg-vf-snippet { background: #edf2f7; border-top-color: #e5edf4; color: #1e6da0; }
+body[data-theme="light"] .cg-vf-doc-chip { background: #f1f8eb; border-top-color: #d4e8c2; color: #4a7a30; }
+body[data-theme="light"] .cg-vf-source-val { color: #1e6da0; border-left-color: #9ab0d0; }
 body[data-theme="light"] .cg-vf-node.cg-vf-connect-input { background: #f8f0ff !important; }
 body[data-theme="light"] .cg-vf-node.cg-vf-custom-input { background: #f0fdfd !important; }
 body[data-theme="light"] #cg-vf-legend { background: rgba(255,255,255,0.96); border-color: #c8d4de; color: #1a2535; box-shadow: 0 4px 18px rgba(0,0,0,0.12); }
@@ -1384,6 +2421,33 @@ body[data-theme="light"] #cg-vf-dead-btn { background: #fff5f5; color: #dc2626; 
 body[data-theme="light"] #cg-vf-dead-btn:hover { background: #fee2e2; }
 body[data-theme="light"] #cg-vf-annot-btn { background: #f0fdf4; color: #15803d; border-color: #86efac; }
 body[data-theme="light"] #cg-vf-annot-btn:hover { background: #dcfce7; }
+body[data-theme="light"] #cg-vf-scope-btn { background: #f0f6ff; color: #1d4ed8; border-color: #93c5fd; }
+body[data-theme="light"] #cg-vf-scope-btn:hover { background: #dbeafe; }
+body[data-theme="light"] #cg-vf-scope-btn.active { background: #bfdbfe; border-color: #2563eb; }
+body[data-theme="light"] #cg-vf-backward-btn { background: #fffaf0; color: #b45309; border-color: #fcd34d; }
+body[data-theme="light"] #cg-vf-backward-btn:hover { background: #fef3c7; }
+body[data-theme="light"] #cg-vf-backward-btn.active { background: #fde68a; border-color: #d97706; }
+body[data-theme="light"] #cg-vf-hldir-btn { background: #f5f3ff; color: #7c3aed; border-color: #c4b5fd; }
+body[data-theme="light"] #cg-vf-hldir-btn:hover { background: #ede9fe; }
+body[data-theme="light"] #cg-vf-hldir-btn.active { background: #ddd6fe; border-color: #7c3aed; }
+body[data-theme="light"] .cg-trace-ctl .cg-trace-cb-lbl,
+body[data-theme="light"] #cg-vf-trace-cb-lbl { color: #7c3aed; }
+body[data-theme="light"] .cg-trace-ctl .cg-trace-dir-btn { background: #f5f3ff; color: #7c3aed; border-color: #c4b5fd; }
+body[data-theme="light"] .cg-trace-ctl .cg-trace-dir-btn:hover { background: #ede9fe; }
+body[data-theme="light"] .cg-trace-ctl .cg-trace-dir-btn.active { background: #ddd6fe; border-color: #7c3aed; }
+body[data-theme="light"] #cg-fn-trace-ctl { background: rgba(255,255,255,0.92); border-color: #c8d4de; }
+body[data-theme="light"] .cg-vf-fam-btn { background: #f4f7fa; color: #7a8898; border-color: #c8d4de; }
+body[data-theme="light"] .cg-vf-fam-btn.active { background: #e8f0fa; color: #1a2535; border-color: #6e8fa8; }
+body[data-theme="light"] .cg-vf-fam-btn[data-fam="lugasi"].active { border-color: #d97706; color: #b45309; background: #fef3c7; }
+body[data-theme="light"] .cg-vf-fam-btn[data-fam="connect"].active { border-color: #0284c7; color: #0369a1; background: #e0f2fe; }
+body[data-theme="light"] .cg-vf-fam-btn[data-fam="member"].active { border-color: #7c3aed; color: #6d28d9; background: #ede9fe; }
+body[data-theme="light"] .cg-vf-fam-btn[data-fam="variable"].active { border-color: #15803d; color: #166534; background: #dcfce7; }
+body[data-theme="light"] .cg-vf-fam-sep { background: #c8d4de; }
+body[data-theme="light"] .cg-vf-fam-show-btn { background: #f4f7fa; color: #1a2535; border-color: #c8d4de; }
+body[data-theme="light"] .cg-vf-fam-show-btn:hover { background: #e8f0fa; border-color: #6e8fa8; }
+body[data-theme="light"] .cg-vf-fam-show-btn.active { background: #e0f2fe; border-color: #0284c7; color: #0369a1; }
+body[data-theme="light"] .cg-vf-fam-show-btn[data-fam="lugasi"].active { border-color: #d97706; color: #b45309; background: #fef3c7; }
+body[data-theme="light"] .cg-vf-fam-show-btn[data-fam="connect"].active { border-color: #0284c7; color: #0369a1; background: #e0f2fe; }
 body[data-theme="light"] #cg-annot-picker { background: #fff; border-color: #c8d4de; box-shadow: 0 8px 32px rgba(0,0,0,0.18); }
 body[data-theme="light"] #cg-annot-picker-title { color: #7a8898; }
 body[data-theme="light"] #cg-annot-picker-lbl { background: #fff; border-color: #9eb4c8; color: #1a2535; }
@@ -1631,9 +2695,14 @@ _SIDEBAR_JS = """
   var VAR_PARENT    = CG_VAR_PARENT;
   var VAR_FLOW_DATA = CG_VAR_FLOW_DATA;
   var GRAPH_ID      = CG_GRAPH_ID;      /* unique hash per generated graph */
+  window.cgGraphId = GRAPH_ID;          /* exposed so the Nodebook engine can scope its storage */
   var LARGE_GRAPH   = CG_LARGE_GRAPH;  /* true when node count >= LARGE threshold (2000) */
   var HUGE_GRAPH    = CG_HUGE_GRAPH;   /* true when node count >= HUGE threshold (default 8000) */
   var HUGE_THRESHOLD = CG_HUGE_THRESHOLD;
+  var VIRT_DOM      = CG_VIRT_DOM;     /* PERF-8: viewport virtualisation for DOM modes */
+  window.CG_VIRT_DOM = VIRT_DOM;       /* exposed so the extras IIFE (module/include) can read it */
+  var ROOT_RANKS    = CG_ROOT_RANKS;   /* {node_id: rank} for top-3 root candidates */
+  window.CGX_ROOT_RANKS = ROOT_RANKS;  /* exposed for module/include extras */
   var SV_LAYOUT_KEY = GRAPH_ID + ':cg_sv_layout_v1';
   var VF_LAYOUT_PFX = GRAPH_ID + ':cg_vf_layout_v1::';
   window.CGX_NODE_DATA = NODE_DATA;
@@ -1654,6 +2723,203 @@ _SIDEBAR_JS = """
      in the Variable Flow search dropdown. */
   var _VF_KEYS = Object.keys(VAR_FLOW_DATA);
 
+  /* VF-8: hotspot scoring — rank variables by total occurrences + fan-out.
+   * Computed once; used to sort the empty-query dropdown and badge top items.
+   * Score = occ_count + fn_fanout * 3  (fan-out weighted 3× to surface
+   * "god variables" that touch many functions over just deeply-occurring ones). */
+  var _VF_HOTSPOT = {};
+  var _VF_HOTSPOT_MAX = 0;
+  _VF_KEYS.forEach(function(k) {
+    var occs = VAR_FLOW_DATA[k] || [];
+    var fnSet = {};
+    occs.forEach(function(o) { fnSet[o.function_id || o.function_name || '?'] = true; });
+    var fanout = Object.keys(fnSet).length;
+    var score = occs.length + fanout * 3;
+    _VF_HOTSPOT[k] = score;
+    if (score > _VF_HOTSPOT_MAX) _VF_HOTSPOT_MAX = score;
+  });
+  /* Threshold: show 🔥 badge when score is above 90th-percentile of all variables. */
+  var _VF_HOTSPOT_SCORES = _VF_KEYS.map(function(k){ return _VF_HOTSPOT[k]; }).sort(function(a,b){ return b-a; });
+  var _VF_HOTSPOT_P90 = _VF_HOTSPOT_SCORES[Math.floor(_VF_HOTSPOT_SCORES.length * 0.1)] || 8;
+
+  /* ── PERF-8: viewport virtualisation helper ──────────────────────────
+     Applies CSS `content-visibility:auto` to every node element in a custom-DOM
+     mode so the browser natively skips layout+paint of off-screen cards while
+     panning huge solution graphs. `contain-intrinsic-size` is pinned to each
+     element's REAL measured size so card.offsetWidth/Height (used by edge,
+     marquee, fit and drag logic) stay correct even while the card is skipped.
+     A two-pass read-then-write avoids interleaved layout thrash. Inert (no-op)
+     unless VIRT_DOM is on, so default small-graph output is unchanged. */
+  function _cgVirtualize(rootEl, selector) {
+    if (!window.CG_VIRT_DOM || !rootEl) return;
+    var els = rootEl.querySelectorAll(selector);
+    if (!els.length) return;
+    var dims = new Array(els.length);
+    for (var i = 0; i < els.length; i++) {           /* pass 1: read all sizes */
+      dims[i] = [els[i].offsetWidth, els[i].offsetHeight];
+    }
+    for (var j = 0; j < els.length; j++) {           /* pass 2: write virt props */
+      var w = dims[j][0], h = dims[j][1];
+      if (w > 0 && h > 0) {
+        els[j].style.containIntrinsicSize = w + 'px ' + h + 'px';
+        els[j].style.contentVisibility = 'auto';
+      }
+    }
+  }
+  window._cgVirtualize = _cgVirtualize;
+  /* Refresh one element's pinned intrinsic-size after its content height changes
+     (e.g. a Script-View card collapse/expand). Safe to call while on-screen. */
+  function _cgVirtRefresh(el) {
+    if (!window.CG_VIRT_DOM || !el) return el;
+    el.style.contentVisibility = '';                 /* force full render to measure */
+    var w = el.offsetWidth, h = el.offsetHeight;
+    return { el: el, w: w, h: h,
+      apply: function() {
+        if (w > 0 && h > 0) {
+          el.style.containIntrinsicSize = w + 'px ' + h + 'px';
+          el.style.contentVisibility = 'auto';
+        }
+      } };
+  }
+  window._cgVirtRefresh = _cgVirtRefresh;
+
+  /* ── Shared flow-trace colour engine (cross-mode) ─────────────────────
+     Extracted from Variable Flow's VF-2/VF-6 branch highlight so every mode
+     (Function / Script / Module / Include / Var Flow) can "click a node →
+     colour each downstream/upstream flow path" identically.
+
+     Pure function: given the clicked origin, a flat edge list and a direction,
+     it returns per-node branch colours + merge flags. Each mode then paints the
+     result onto its own DOM/canvas. No DOM access here, so it is safe to call
+     from either embedded script (it lives on `window`).
+
+       origin    : node id that was clicked
+       edges     : [{from, to}, ...] in the current mode
+       direction : 'downstream' (forward edges) | 'upstream' (reverse edges)
+     returns {
+       color     : { nodeId: 'hsl(...)' }   per-branch colour for reached nodes
+       hue       : { nodeId: <deg> }         numeric hue (marker grouping)
+       merge     : { nodeId: true }          reached from >1 immediate branch
+       neighbors : [immediate branch node ids]
+       nBranch   : neighbors.length
+       branchColor(i) -> legend swatch colour for branch i
+     } */
+  function cgFlowTraceColors(origin, edges, direction) {
+    var isUpstream = (direction === 'upstream');
+    var adj = {};
+    (edges || []).forEach(function(e) {
+      if (!e) return;
+      var src = isUpstream ? e.to : e.from;
+      var dst = isUpstream ? e.from : e.to;
+      if (src == null || dst == null) return;
+      if (!adj[src]) adj[src] = [];
+      if (adj[src].indexOf(dst) < 0) adj[src].push(dst);
+    });
+    function _hsl(h, s, l) {
+      h = ((Math.round(h) % 360) + 360) % 360;
+      return 'hsl(' + h + ',' + Math.round(s) + '%,' + Math.round(l) + '%)';
+    }
+    function _lightness(depth) { return Math.max(40, 64 - depth * 4); }
+    var neighbors = adj[origin] || [];
+    var nBranch = neighbors.length;
+    var colorOf = {}, hueOf = {}, branchSet = {}, visited = {};
+    function _rec(id, b) { if (!branchSet[id]) branchSet[id] = {}; branchSet[id][b] = true; }
+    var stack = [];
+    neighbors.forEach(function(cid, i) {
+      stack.push({ id: cid, hue: i * (360 / nBranch), depth: 1, branchIdx: i });
+    });
+    while (stack.length) {
+      var cur = stack.pop();
+      _rec(cur.id, cur.branchIdx);
+      if (visited[cur.id]) continue;
+      visited[cur.id] = true;
+      hueOf[cur.id] = cur.hue;
+      colorOf[cur.id] = _hsl(cur.hue, 68, _lightness(cur.depth));
+      var kids = (adj[cur.id] || []).filter(function(k) { return k !== origin; });
+      var k = kids.length;
+      kids.forEach(function(kid, j) {
+        var childHue = (k > 1)
+          ? cur.hue + (j - (k - 1) / 2) * (30 / cur.depth)
+          : cur.hue;
+        if (!visited[kid]) {
+          stack.push({ id: kid, hue: childHue, depth: cur.depth + 1, branchIdx: cur.branchIdx });
+        } else {
+          _rec(kid, cur.branchIdx);
+        }
+      });
+    }
+    var merge = {};
+    Object.keys(branchSet).forEach(function(id) {
+      if (Object.keys(branchSet[id]).length > 1) merge[id] = true;
+    });
+    return {
+      color: colorOf, hue: hueOf, merge: merge,
+      neighbors: neighbors, nBranch: nBranch,
+      branchColor: function(i) { return _hsl(i * (360 / nBranch), 68, 60); }
+    };
+  }
+  window.cgFlowTraceColors = cgFlowTraceColors;
+
+  /* Per-mode flow-trace preference helpers (enable flag + direction), persisted
+     independently per mode in localStorage. Default: enabled + downstream. */
+  function cgTraceEnabled(mode) {
+    try {
+      var v = localStorage.getItem('cg-trace-enabled-' + mode);
+      return v === null ? true : (v === '1');
+    } catch (e) { return true; }
+  }
+  function cgTraceSetEnabled(mode, on) {
+    try { localStorage.setItem('cg-trace-enabled-' + mode, on ? '1' : '0'); } catch (e) {}
+  }
+  function cgTraceDir(mode) {
+    try { return localStorage.getItem('cg-trace-dir-' + mode) || 'downstream'; }
+    catch (e) { return 'downstream'; }
+  }
+  function cgTraceSetDir(mode, dir) {
+    try { localStorage.setItem('cg-trace-dir-' + mode, dir); } catch (e) {}
+  }
+  window.cgTraceEnabled = cgTraceEnabled;
+  window.cgTraceSetEnabled = cgTraceSetEnabled;
+  window.cgTraceDir = cgTraceDir;
+  window.cgTraceSetDir = cgTraceSetDir;
+
+  /* ── Reusable toolbar control: [☑ Trace] [⇟ Downstream] ───────────────
+     Builds a compact control group for a mode's toolbar. `onToggle(enabled)`
+     and `onDir(dir)` fire when the user flips the checkbox / direction button.
+     Returns the container element (caller appends it wherever it likes). */
+  function cgBuildTraceControl(mode, onToggle, onDir) {
+    var wrap = document.createElement('span');
+    wrap.className = 'cg-trace-ctl';
+    wrap.setAttribute('data-mode', mode);
+    var enabled = cgTraceEnabled(mode);
+    var dir = cgTraceDir(mode);
+    var cbId = 'cg-trace-cb-' + mode;
+    wrap.innerHTML =
+      '<label class="cg-trace-cb-lbl" title="Click a node to colour its flow paths. ' +
+        'Uncheck to drag nodes without re-tracing.">' +
+        '<input type="checkbox" id="' + cbId + '"' + (enabled ? ' checked' : '') + '> trace' +
+      '</label>' +
+      '<button type="button" class="cg-trace-dir-btn' + (dir === 'upstream' ? ' active' : '') + '" ' +
+        'title="Flow direction: Downstream = nodes this flows into; Upstream = nodes that feed into this">' +
+        (dir === 'upstream' ? '\u2b9d Upstream' : '\u2b9f Downstream') +
+      '</button>';
+    var cb = wrap.querySelector('input');
+    var db = wrap.querySelector('.cg-trace-dir-btn');
+    if (cb) cb.addEventListener('change', function() {
+      cgTraceSetEnabled(mode, cb.checked);
+      if (onToggle) onToggle(cb.checked);
+    });
+    if (db) db.addEventListener('click', function() {
+      var nd = (cgTraceDir(mode) === 'upstream') ? 'downstream' : 'upstream';
+      cgTraceSetDir(mode, nd);
+      db.classList.toggle('active', nd === 'upstream');
+      db.textContent = (nd === 'upstream') ? '\u2b9d Upstream' : '\u2b9f Downstream';
+      if (onDir) onDir(nd);
+    });
+    return wrap;
+  }
+  window.cgBuildTraceControl = cgBuildTraceControl;
+
   /* CONNECT_INDEX[lowercased connect_input_name] = [.Connect receiver occurrences]
      Used by _vfBuildFlowChain to link a LUGASI block to the .Connect block that
      consumes that input, even when they live in different functions and have
@@ -1666,6 +2932,19 @@ _SIDEBAR_JS = """
       if (o.source_kind === 'input_file_connect' && o.connect_input_name) {
         var key = String(o.connect_input_name).toLowerCase().trim();
         if (key) (CONNECT_INDEX[key] = CONNECT_INDEX[key] || []).push(o);
+      }
+    });
+  });
+
+  /* ASSIGN_DST_INDEX["fnId::srcVarLower"] = [{dstKey, occ}, ...]
+     Built from VAR_FLOW_DATA occurrences that have assign_src set.
+     Used by _vfBuildFlowChain (VFI-3) to find variables assigned FROM a tracked var. */
+  var ASSIGN_DST_INDEX = {};
+  _VF_KEYS.forEach(function(dstKey) {
+    VAR_FLOW_DATA[dstKey].forEach(function(o) {
+      if (o.assign_src) {
+        var k2 = o.function_id + '::' + String(o.assign_src).toLowerCase();
+        (ASSIGN_DST_INDEX[k2] = ASSIGN_DST_INDEX[k2] || []).push({dstKey: dstKey, occ: o});
       }
     });
   });
@@ -1684,7 +2963,9 @@ _SIDEBAR_JS = """
   var _svMarquee = null, _svMultiSel = {};
   /* Layout toggle state */
   var _fnStraightLines = false;
-  var _fnHierarchical  = true;   /* comfortable default: layered function view */
+  var _fnHierarchical  = false;  /* default: precomputed file-clustered layout
+                                    (callers above callees + same-file grouping).
+                                    "Layered" button opts into vis.js hierarchical. */
   var _fnMarquee = null;
   var _fnMidPan  = null;   /* middle-mouse pan state for Function Nodes (vis.js) */
   var _fnGroupDrag = null;
@@ -1712,6 +2993,18 @@ _SIDEBAR_JS = """
   var _vfBranchOriginId = null;   /* node id the coloured branches emanate from */
   var _vfBranchNodeColor = {};    /* nodeId -> hsl() colour of its branch */
   var _vfBranchMerge     = {};    /* nodeId -> true when reached by >1 branch */
+  /* VF-6: click-highlight direction: 'downstream' (default/VF-2) or 'upstream' */
+  var _vfHighlightDirection = (function(){
+    try { return localStorage.getItem('cg-vf-highlight-dir') || 'downstream'; } catch(e) { return 'downstream'; }
+  })();
+  /* VF-4: family visibility filter — toggle each family on/off */
+  var _vfFamilyFilter = (function(){
+    var def = { lugasi: true, connect: true, member: true, variable: true };
+    try {
+      var s = localStorage.getItem('cg-vf-family-filter');
+      return s ? Object.assign(def, JSON.parse(s)) : def;
+    } catch(e) { return def; }
+  })();
 
   /* ── Network accessor ─────────────────────────────────────── */
   function getNet() {
@@ -1922,6 +3215,156 @@ _SIDEBAR_JS = """
     }
     _applyScriptEdgeHighlight(edge);
   }
+
+  /* ── Function-mode flow-trace (vis.js) ───────────────────────────────
+     Click a node → colour its downstream/upstream flow paths using the shared
+     cross-mode engine. This vis.js build does NOT support a per-node `opacity`
+     option (confirmed via diagnostics), so dimming is done with supported
+     channels only: muted `color`/`font` for non-traced nodes, branch-hued
+     `color.border` + `shadow` for traced nodes, and — most importantly — the
+     vis EDGES along each path are recoloured per branch (with the rest dimmed
+     via the supported edge `color.opacity`) so the downstream/upstream flow is
+     clearly visible. Original node AND edge styling is snapshotted so clearing
+     restores the exact prior look, including any active edge-category colours
+     (Rule 9). The click→summary (selectNode→openDetail) keeps working — the
+     trace layers on top of it. */
+  var _fnTraceOrigin = null;
+  var _fnTraceSnap = {};
+  var _fnTraceEdgeSnap = {};
+  function _fnTraceSnapshot(ds, id) {
+    if (_fnTraceSnap[id]) return;
+    var it = ds.get(id) || {};
+    _fnTraceSnap[id] = { color: it.color, borderWidth: it.borderWidth,
+                         shadow: it.shadow, font: it.font };
+  }
+  function _fnTraceSnapEdge(ds, id) {
+    if (_fnTraceEdgeSnap[id]) return;
+    var it = ds.get(id) || {};
+    _fnTraceEdgeSnap[id] = { color: it.color, width: it.width };
+  }
+  function _fnDimEdgeColor(snapColor) {
+    var base = '#5a6472';
+    if (typeof snapColor === 'string') base = snapColor;
+    else if (snapColor && snapColor.color) base = snapColor.color;
+    return { color: base, opacity: 0.07 };
+  }
+  function _fnClearTrace() {
+    var net = getNet();
+    if (!net) { _fnTraceSnap = {}; _fnTraceEdgeSnap = {}; _fnTraceOrigin = null; return; }
+    var ds = window.nodes || net.body.data.nodes;
+    var eds = window.edges || net.body.data.edges;
+    var updates = [];
+    Object.keys(_fnTraceSnap).forEach(function(id) {
+      var s = _fnTraceSnap[id];
+      updates.push({ id: id,
+        color: (s.color === undefined ? null : s.color),
+        borderWidth: (s.borderWidth === undefined ? 1 : s.borderWidth),
+        shadow: (s.shadow === undefined ? false : s.shadow),
+        font: (s.font === undefined ? null : s.font) });
+    });
+    if (updates.length && ds) { try { ds.update(updates); } catch(e) {} }
+    var eupd = [];
+    Object.keys(_fnTraceEdgeSnap).forEach(function(id) {
+      var s = _fnTraceEdgeSnap[id];
+      eupd.push({ id: id,
+        color: (s.color === undefined ? null : s.color),
+        width: (s.width === undefined ? null : s.width) });
+    });
+    if (eupd.length && eds) { try { eds.update(eupd); } catch(e) {} }
+    _fnTraceSnap = {};
+    _fnTraceEdgeSnap = {};
+    _fnTraceOrigin = null;
+    try { net.redraw(); } catch(e) {}
+  }
+  function _fnApplyTrace(originId) {
+    var net = getNet();
+    if (!net) return;
+    var ds = window.nodes || net.body.data.nodes;
+    if (!ds) return;
+    _fnClearTrace();
+    var trace = window.cgFlowTraceColors(originId, EDGE_DATA, window.cgTraceDir('fn'));
+    if (!trace.neighbors.length) return;   /* leaf/root in this direction */
+    _fnTraceOrigin = originId;
+    var updates = [];
+    ds.getIds().forEach(function(id) {
+      _fnTraceSnapshot(ds, id);
+      if (id === originId) {
+        updates.push({ id: id, borderWidth: 3,
+          shadow: { enabled: true, color: 'rgba(247,215,116,0.95)', size: 20, x: 0, y: 0 } });
+        return;
+      }
+      var c = trace.color[id];
+      if (c) {
+        var oc = _fnTraceSnap[id].color;
+        var bg = (oc && typeof oc === 'object' && oc.background) ? oc.background
+               : (typeof oc === 'string' ? oc : '#1f2630');
+        var sz = trace.merge[id] ? 20 : 14;
+        updates.push({ id: id, borderWidth: 3,
+          color: { background: bg, border: c, highlight: { background: bg, border: c } },
+          shadow: { enabled: true, color: c, size: sz, x: 0, y: 0 } });
+      } else {
+        updates.push({ id: id, borderWidth: 1, shadow: false,
+          color: { background: '#222831', border: '#333a44',
+                   highlight: { background: '#222831', border: '#333a44' } },
+          font: { color: '#55606e' } });
+      }
+    });
+    try { ds.update(updates); } catch(e) {}
+
+    /* Colour the vis edges along the traced paths; dim the rest. */
+    var eds = window.edges || net.body.data.edges;
+    if (eds) {
+      var isUp = (window.cgTraceDir('fn') === 'upstream');
+      var origStr = String(originId);
+      var eupd = [];
+      eds.getIds().forEach(function(eid) {
+        _fnTraceSnapEdge(eds, eid);
+        var ed = null;
+        for (var k = 0; k < EDGE_DATA.length; k++) {
+          if (String(EDGE_DATA[k].id) === String(eid)) { ed = EDGE_DATA[k]; break; }
+        }
+        var ecol = null;
+        if (ed) {
+          var src = isUp ? ed.to : ed.from;
+          var dst = isUp ? ed.from : ed.to;
+          var srcOk = (String(src) === origStr) || trace.color[src];
+          var dc = trace.color[dst];
+          if (srcOk && dc) ecol = dc;
+        }
+        if (ecol) {
+          eupd.push({ id: eid, width: 3,
+            color: { color: ecol, highlight: ecol, opacity: 1, inherit: false } });
+        } else {
+          var dc2 = _fnDimEdgeColor(_fnTraceEdgeSnap[eid].color);
+          eupd.push({ id: eid,
+            color: { color: dc2.color, highlight: dc2.color, opacity: dc2.opacity, inherit: false } });
+        }
+      });
+      if (eupd.length) { try { eds.update(eupd); } catch(e) {} }
+    }
+    try { net.redraw(); } catch(e) {}
+  }
+  window._fnClearTrace = _fnClearTrace;
+
+  /* Floating control for Function mode (it has no per-mode toolbar). */
+  function _fnEnsureTraceControl() {
+    if (document.getElementById('cg-fn-trace-ctl')) return;
+    var netEl = document.getElementById('mynetwork');
+    var host = (netEl && netEl.parentElement) ? netEl.parentElement : netEl;
+    if (!host) return;
+    if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+    var ctl = window.cgBuildTraceControl('fn',
+      function(enabled) { if (!enabled) _fnClearTrace(); },
+      function(dir) { if (_fnTraceOrigin) _fnApplyTrace(_fnTraceOrigin); });
+    ctl.id = 'cg-fn-trace-ctl';
+    host.appendChild(ctl);
+    _fnSyncTraceControlVis();
+  }
+  function _fnSyncTraceControlVis() {
+    var ctl = document.getElementById('cg-fn-trace-ctl');
+    if (ctl) ctl.style.display = (currentMode === 'fn') ? '' : 'none';
+  }
+  window._fnSyncTraceControlVis = _fnSyncTraceControlVis;
 
   function _edgeCallText(edge) {
     var args = Array.isArray(edge.args) ? edge.args : [];
@@ -2419,7 +3862,21 @@ _SIDEBAR_JS = """
     _flashBtn(btnExpand, Object.keys(visited).length + ' shown', 1400);
   });
 
+  /* Clear any active flow-trace highlight, in whichever mode is active. */
+  function _cgClearAllTraces() {
+    try { _fnClearTrace(); } catch(e) {}
+    try { _svClearTrace(); } catch(e) {}
+    try { if (_vfBranchActive) _vfClearBranchHighlight(); } catch(e) {}
+    try { if (window._mvClearTrace) window._mvClearTrace(); } catch(e) {}
+    try { if (window._ivClearTrace) window._ivClearTrace(); } catch(e) {}
+  }
+  window._cgClearAllTraces = _cgClearAllTraces;
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') _cgClearAllTraces();
+  });
+
   if (btnClearFocus) btnClearFocus.addEventListener('click', function() {
+    _cgClearAllTraces();
     if (currentMode === 'varflow') { _vfClearHighlight(); return; }
     selectedNode = null;
     if (currentMode === 'script') { _svClearHighlight(); updateHint([]); return; }
@@ -2439,6 +3896,7 @@ _SIDEBAR_JS = """
   });
 
   if (btnShowAll) btnShowAll.addEventListener('click', function() {
+    _cgClearAllTraces();
     if (currentMode === 'varflow') { _vfClearHighlight(); return; }
     selectedNode = null;
     if (currentMode === 'script') { _svClearHighlight(); updateHint([]); return; }
@@ -2451,7 +3909,7 @@ _SIDEBAR_JS = """
   /* Save Layout — mode-aware explicit snapshot to localStorage */
   if (btnSaveLayout) btnSaveLayout.addEventListener('click', function() {
     if (currentMode === 'varflow') {
-      try { localStorage.setItem(VF_LAYOUT_PFX + (_vfCurrentVar||''), JSON.stringify(_vfNodeOverrides)); } catch(e) {}
+      try { localStorage.setItem(VF_LAYOUT_PFX + _vfLayoutKey(), JSON.stringify(_vfNodeOverrides)); } catch(e) {}
       _flashBtn(btnSaveLayout, 'Saved!', 1200);
       return;
     }
@@ -2498,7 +3956,7 @@ _SIDEBAR_JS = """
   if (btnClearSaved) btnClearSaved.addEventListener('click', function() {
     if (currentMode === 'varflow') {
       _vfNodeOverrides = {};
-      try { localStorage.removeItem(VF_LAYOUT_PFX + (_vfCurrentVar||'')); } catch(e) {}
+      try { localStorage.removeItem(VF_LAYOUT_PFX + _vfLayoutKey()); } catch(e) {}
       _flashBtn(btnClearSaved, 'Cleared!', 1600);
       return;
     }
@@ -2530,6 +3988,8 @@ _SIDEBAR_JS = """
     h += '<span class="hp-badge ' + langCls + '">' + esc(meta.is_external ? 'external' : meta.language) + '</span>';
     if (meta.func_type)
       h += '<span class="hp-badge hp-ftype">' + esc(meta.func_type) + '</span>';
+    if (meta.is_virtual)
+      h += '<span class="hp-badge hp-virtual">virtual</span>';
     h += '</div>';
 
     h += '<div class="hp-name">' + esc(meta.qualified_name || meta.name) + '</div>';
@@ -2693,6 +4153,7 @@ _SIDEBAR_JS = """
     if (m.is_external) langCls = 'hp-lang-ext';
     h += '<span class="hp-badge ' + langCls + '">' + esc(m.is_external?'external':m.language) + '</span>';
     if (m.func_type) h += '<span class="hp-badge hp-ftype">' + esc(m.func_type) + '</span>';
+    if (m.is_virtual) h += '<span class="hp-badge hp-virtual">virtual</span>';
     h += '</div>';
 
     /* Name */
@@ -2995,10 +4456,9 @@ _SIDEBAR_JS = """
       });
     }
 
-    /* Comfortable default across modes: function view starts in layered mode. */
-    try {
-      if (!HUGE_GRAPH && window._cgApplyFnHierarchicalDefault) window._cgApplyFnHierarchicalDefault(net);
-    } catch(e) {}
+    /* Default function view = precomputed file-clustered layout (INITIAL_POS +
+       saved delta already applied above). The "Layered" button opts into vis.js
+       hierarchical on demand; we no longer auto-apply it on load. */
 
     /* Fit immediately — drawGraph() ran synchronously before wire(), so afterDrawing
        may never fire for the first draw. Call fit() directly to ensure the viewport
@@ -3104,8 +4564,21 @@ _SIDEBAR_JS = """
       });
     }
 
-    /* Click on edge: show call details. Click on background: close detail panel. */
+    /* Click on node: flow-trace only (no edge popup). Click on a bare edge:
+       show call details. Click on background: close detail panel + clear. */
     net.on('click', function(p) {
+      if (p.nodes && p.nodes.length) {
+        /* A node was clicked → the ONLY action is the flow-trace highlight
+           (gated by the per-mode checkbox). No "X calls Y" edge popup, even
+           though vis includes the node's connected edges in p.edges.
+           The short summary on the right is driven separately by selectNode.
+           Clicking the same origin again clears the trace (keeps the summary). */
+        if (window.cgTraceEnabled('fn')) {
+          if (_fnTraceOrigin === p.nodes[0]) _fnClearTrace();
+          else _fnApplyTrace(p.nodes[0]);
+        }
+        return;
+      }
       if (p.edges && p.edges.length) {
         showEdgeDetails(p.edges[0], p.event && p.event.srcEvent);
         return;
@@ -3114,8 +4587,10 @@ _SIDEBAR_JS = """
         var d = document.getElementById('cg-detail');
         if (d) d.classList.remove('open');
         _clearEdgeHighlight(false);
+        _fnClearTrace();
       }
     });
+    _fnEnsureTraceControl();
   }
   /* ── Large-graph warning + level-of-detail ─────────────────── */
   (function() {
@@ -3244,6 +4719,7 @@ _SIDEBAR_JS = """
       /* Inject Fn-mode annotation layer on first show */
       setTimeout(_fnInitAnnotLayer, 80);
     }
+    if (window._fnSyncTraceControlVis) window._fnSyncTraceControlVis();
   }
 
   if (btnModeFn) btnModeFn.addEventListener('click', function() { setViewMode('fn'); });
@@ -3259,6 +4735,7 @@ _SIDEBAR_JS = """
   window._cgSetCurrentMode = function(mode) {
     currentMode = mode;
     _updateLayoutBtns(mode);
+    if (window._fnSyncTraceControlVis) window._fnSyncTraceControlVis();
     if (searchInput) {
       if (mode === 'inc') searchInput.placeholder = 'Header name...';
       else if (mode === 'module') searchInput.placeholder = 'Module name...';
@@ -3300,7 +4777,15 @@ _SIDEBAR_JS = """
     var cx = parseFloat(card.style.left)||0;
     var cy = parseFloat(card.style.top)||0;
     var cw = card.offsetWidth || 290;
-    var ry = cy + row.offsetTop + row.offsetHeight/2;
+    var ot = row.offsetTop, oh = row.offsetHeight;
+    /* PERF-8: when content-visibility skips this off-screen card the inner row
+       offsets read 0 — fall back to the build-time cache. Collapsed cards keep
+       their legacy header-anchored behaviour (oh stays 0). */
+    if (!oh && !card.classList.contains('sv-collapsed')) {
+      var _g = (window._svRowGeom||{})[nid];
+      if (_g) { ot = _g.oy; oh = _g.oh; }
+    }
+    var ry = cy + ot + oh/2;
     return { fp:card.dataset.fp, lx:cx, ly:ry, rx:cx+cw, ry:ry };
   }
 
@@ -3402,6 +4887,19 @@ _SIDEBAR_JS = """
     });
 
     function fname(fp) { return fp.replace(/.*[\\\\/]/g, ''); }
+    function folderOf(fp) {
+      var m = String(fp).replace(/[\\\\/]+$/, '').match(/^(.*)[\\\\/][^\\\\/]+$/);
+      return m ? m[1] : '';
+    }
+    function compFolder(comp) {
+      /* dominant immediate-parent folder among a component's files */
+      var counts = {}, best = '', bestN = -1;
+      comp.forEach(function(fp){ var f = folderOf(fp); counts[f] = (counts[f]||0)+1; });
+      Object.keys(counts).forEach(function(f){
+        if (counts[f] > bestN || (counts[f] === bestN && f < best)) { bestN = counts[f]; best = f; }
+      });
+      return best;
+    }
     function fileSort(a, b) {
       var la = langRank[fileMap[a].lang] == null ? 99 : langRank[fileMap[a].lang];
       var lb = langRank[fileMap[b].lang] == null ? 99 : langRank[fileMap[b].lang];
@@ -3446,6 +4944,24 @@ _SIDEBAR_JS = """
       if (al !== bl) return al - bl;
       return b.length - a.length || fileSort(af, bf);
     });
+
+    /* Folder super-clusters: keep the ordering heuristic above as the folder
+       order (first-seen), but make all components of the same immediate-parent
+       folder contiguous so same-folder file-cards sit together. Spacing only —
+       a FOLDER_GAP is inserted between folders during packing (no labels). */
+    (function() {
+      var seen = {}, buckets = [], byFolder = {};
+      comps.forEach(function(comp) {
+        var f = compFolder(comp);
+        if (!(f in byFolder)) { byFolder[f] = []; buckets.push(f); seen[f] = true; }
+        byFolder[f].push(comp);
+      });
+      var regrouped = [];
+      buckets.forEach(function(f) {
+        byFolder[f].forEach(function(comp) { comp._folder = f; regrouped.push(comp); });
+      });
+      comps = regrouped;
+    })();
 
     function layoutComponent(comp) {
       var compSet = {};
@@ -3538,10 +5054,20 @@ _SIDEBAR_JS = """
     var CARD_GAP_X = _svCardGapX, CARD_GAP_Y = _svCardGapY, COMP_GAP_X = _svCompGapX, COMP_GAP_Y = _svCompGapY;
     var MAX_CANVAS_W = 9000;
     var cursorX = 80, cursorY = 80, rowH = 0;
+    /* Each distinct immediate-parent folder starts on its own row band, with a
+       clear vertical gap, so folders read as separate horizontal clusters even
+       when components wrap. Spacing only — no labels or bands. */
+    var FOLDER_GAP_Y = Math.round(COMP_GAP_Y * 1.8);
+    var prevFolder = null;
     comps.forEach(function(comp) {
       var laid = layoutComponent(comp);
       var compW = laid.layerKeys.length * cardW + Math.max(0, laid.layerKeys.length - 1) * CARD_GAP_X;
       var compH = Math.max.apply(null, laid.layerKeys.map(function(l){ return columnHeight(laid.layers[l]); }).concat([100]));
+      /* new folder → break to a fresh row band with extra vertical separation */
+      if (prevFolder !== null && comp._folder !== prevFolder && cursorX > 80) {
+        cursorX = 80; cursorY += rowH + FOLDER_GAP_Y; rowH = 0;
+      }
+      prevFolder = comp._folder;
       if (cursorX > 80 && cursorX + compW > MAX_CANVAS_W) {
         cursorX = 80; cursorY += rowH + COMP_GAP_Y; rowH = 0;
       }
@@ -3624,6 +5150,12 @@ _SIDEBAR_JS = """
       cardsHtml += '<div class="cg-dot" style="background:' + dotColor + ';flex-shrink:0;margin-top:0"></div>';
       cardsHtml += '<div class="cg-fc-fname">' + esc(fname) + '</div>';
       if (dirPart) cardsHtml += '<div class="cg-fc-dir" title="' + esc(fp) + '">' + esc(dirPart) + '</div>';
+      /* Root badge: show highest rank among functions in this file */
+      var fileRootRank = null;
+      info.fns.forEach(function(n) { var r = ROOT_RANKS[n.id]; if (r && (fileRootRank === null || r < fileRootRank)) fileRootRank = r; });
+      if (fileRootRank === 1) cardsHtml += '<span class="cg-root-badge rank-1">&#x1F451; Root</span>';
+      else if (fileRootRank === 2) cardsHtml += '<span class="cg-root-badge rank-2">&#x2605; Root #2</span>';
+      else if (fileRootRank === 3) cardsHtml += '<span class="cg-root-badge rank-3">&#x2605; Root #3</span>';
       cardsHtml += '<div class="cg-fc-count">' + info.fns.length + ' fn' + (info.fns.length !== 1 ? 's' : '') + '</div>';
       cardsHtml += '</div><div class="cg-fn-list">';
 
@@ -3710,7 +5242,21 @@ _SIDEBAR_JS = """
         '</div>' +
       '</div>';
     _svRenderAnnots();
+    _svEnsureTraceControl();
     _svRestoreCollapsedState();
+    /* PERF-8: cache each row's geometry (before virtualising) so off-screen edge
+       anchoring stays correct, then virtualise the file cards. Only active when
+       VIRT_DOM is on; otherwise this is a cheap no-op and output is unchanged. */
+    if (window.CG_VIRT_DOM) {
+      var _svCanvasEl = document.getElementById('cg-sv-canvas');
+      window._svRowGeom = {};
+      if (_svCanvasEl) {
+        _svCanvasEl.querySelectorAll('.cg-fn-row[data-nid]').forEach(function(r){
+          window._svRowGeom[r.dataset.nid] = { oy: r.offsetTop, oh: r.offsetHeight };
+        });
+        _cgVirtualize(_svCanvasEl, '.cg-file-card');
+      }
+    }
     _renderAllPins(document.getElementById('cg-sv-canvas'), 'sv', '');
     window._wireSvAnnotEvents && window._wireSvAnnotEvents();
     /* Wire pin right-click on script viewport */
@@ -3739,10 +5285,15 @@ _SIDEBAR_JS = """
         /* Collapse button is handled by its own onclick — just bail */
         if (e.target.closest && e.target.closest('.cg-fc-collapse-btn')) return;
         var row = e.target.closest && e.target.closest('.cg-fn-row[data-nid]');
-        if (row) { _svSelectFn(row.dataset.nid, false); return; }
+        if (row) {
+          _svSelectFn(row.dataset.nid, false);
+          if (window.cgTraceEnabled('script')) _svApplyTrace(row.dataset.nid);
+          return;
+        }
         var hdr = e.target.closest && e.target.closest('.cg-fc-header');
         if (hdr) { var hCard = hdr.closest('.cg-file-card'); if (hCard) _svSelectCard(hCard.dataset.fp); return; }
         _clearEdgeHighlight(false);
+        _svClearTrace();
       });
       canvas.addEventListener('dblclick', function(e) {
         var row = e.target.closest && e.target.closest('.cg-fn-row[data-nid]');
@@ -3913,6 +5464,19 @@ _SIDEBAR_JS = """
     _svMultiSel = map || {};
     _svApplyMultiSel();
   }
+  /* File cards whose center lies inside a graph-space rect (grip-drag bundling) */
+  function _svCardsInRect(rx, ry, rw, rh) {
+    var out = [];
+    var svEl = document.getElementById('cg-script-view');
+    if (!svEl) return out;
+    svEl.querySelectorAll('.cg-file-card').forEach(function(card){
+      var l = parseFloat(card.style.left)||0, t = parseFloat(card.style.top)||0;
+      var cx = l + (card.offsetWidth||0)/2, cy = t + (card.offsetHeight||0)/2;
+      if (cx >= rx && cx <= rx+rw && cy >= ry && cy <= ry+rh) out.push({card:card, origL:l, origT:t});
+    });
+    return out;
+  }
+
   function _svMoveAnnotsBy(dx, dy, selectedRect) {
     try {
       var ann = _svAnnotsLoad();
@@ -3950,6 +5514,73 @@ _SIDEBAR_JS = """
     if (card) card.classList.add('sv-selected');
   }
 
+  /* ── Script-mode flow-trace ──────────────────────────────────────────
+     Same call graph as Function mode (EDGE_DATA), painted onto the file-card
+     function rows + the SVG edges. */
+  var _svTraceOrigin = null;
+  function _svClearTrace() {
+    var svEl = document.getElementById('cg-script-view');
+    _svTraceOrigin = null;
+    if (!svEl) return;
+    svEl.querySelectorAll('.cg-fn-row.cg-trace-lit, .cg-fn-row.cg-trace-dim, .cg-fn-row.cg-trace-merge')
+      .forEach(function(el) {
+        el.classList.remove('cg-trace-lit', 'cg-trace-dim', 'cg-trace-merge');
+        el.style.borderLeft = '';
+        el.style.boxShadow = '';
+      });
+    try { _svDrawEdges(); } catch(e) {}   /* restore edge colours */
+  }
+  window._svClearTrace = _svClearTrace;
+  function _svApplyTrace(originId) {
+    var svEl = document.getElementById('cg-script-view');
+    if (!svEl) return;
+    _svClearTrace();
+    var trace = window.cgFlowTraceColors(originId, EDGE_DATA, window.cgTraceDir('script'));
+    if (!trace.neighbors.length) return;
+    _svTraceOrigin = originId;
+    svEl.querySelectorAll('.cg-fn-row[data-nid]').forEach(function(row) {
+      var id = row.dataset.nid;
+      if (id === originId) return;
+      var c = trace.color[id];
+      if (c) {
+        row.classList.add('cg-trace-lit');
+        row.style.borderLeft = '3px solid ' + c;
+        row.style.boxShadow = 'inset 0 0 0 1px ' + c;
+        if (trace.merge[id]) row.classList.add('cg-trace-merge');
+      } else {
+        row.classList.add('cg-trace-dim');
+      }
+    });
+    var svg = document.getElementById('cg-sv-edges');
+    if (svg) {
+      svg.querySelectorAll('.cg-sv-edge[data-eid]').forEach(function(p) {
+        var e = _edgeById(p.dataset.eid);
+        if (!e) return;
+        var frIn = (e.from === originId) || trace.color[e.from];
+        var toIn = (e.to === originId) || trace.color[e.to];
+        if (frIn && toIn) {
+          var col = trace.color[e.to] || trace.color[e.from];
+          if (col) { p.style.stroke = col; p.style.opacity = '0.95'; p.style.strokeWidth = '2.5'; }
+        } else {
+          p.style.opacity = '0.12';
+        }
+      });
+    }
+  }
+  function _svEnsureTraceControl() {
+    var svEl = document.getElementById('cg-script-view');
+    if (!svEl || document.getElementById('cg-sv-trace-ctl')) return;
+    var ctl = window.cgBuildTraceControl('script',
+      function(enabled) { if (!enabled) _svClearTrace(); },
+      function(dir) { if (_svTraceOrigin) _svApplyTrace(_svTraceOrigin); });
+    ctl.id = 'cg-sv-trace-ctl';
+    ctl.style.cssText = 'position:absolute;top:10px;left:10px;z-index:20;'
+      + 'background:rgba(20,23,30,0.92);border:1px solid #3d4451;border-radius:6px;'
+      + 'padding:6px 9px;box-shadow:0 2px 8px rgba(0,0,0,0.4)';
+    svEl.appendChild(ctl);
+  }
+  window._svEnsureTraceControl = _svEnsureTraceControl;
+
   var _SV_COLLAPSE_KEY = 'cg_sv_collapsed_v1';
   function _svGetCollapsedSet() {
     try { var r = localStorage.getItem(_SV_COLLAPSE_KEY); return r ? JSON.parse(r) : {}; } catch(e) { return {}; }
@@ -3968,6 +5599,17 @@ _SIDEBAR_JS = """
     var set = _svGetCollapsedSet();
     if (collapsed) set[fp] = 1; else delete set[fp];
     _svSaveCollapsedSet(set);
+    /* PERF-8: the card height just changed — re-pin its intrinsic size and refresh
+       the cached row geometry so off-screen anchoring/fit stay correct. */
+    if (window.CG_VIRT_DOM) {
+      var _r = _cgVirtRefresh(card);
+      if (window._svRowGeom) {
+        card.querySelectorAll('.cg-fn-row[data-nid]').forEach(function(rr){
+          window._svRowGeom[rr.dataset.nid] = { oy: rr.offsetTop, oh: rr.offsetHeight };
+        });
+      }
+      if (_r && _r.apply) _r.apply();
+    }
   };
   function _svRestoreCollapsedState() {
     var set = _svGetCollapsedSet();
@@ -4035,7 +5677,12 @@ _SIDEBAR_JS = """
     var cardL = parseFloat(card.style.left) || 0;
     var cardT = parseFloat(card.style.top)  || 0;
     var rowCX = cardL + (parseFloat(card.style.width) || 290) / 2;
-    var rowCY = cardT + row.offsetTop + row.offsetHeight / 2;
+    var ot = row.offsetTop, oh = row.offsetHeight;
+    if (!oh && !card.classList.contains('sv-collapsed')) {     /* PERF-8 off-screen fallback */
+      var _g = (window._svRowGeom||{})[nid];
+      if (_g) { ot = _g.oy; oh = _g.oh; }
+    }
+    var rowCY = cardT + ot + oh / 2;
     _svPanX = vp.offsetWidth  / 2 - rowCX * _svZoom;
     _svPanY = vp.offsetHeight / 2 - rowCY * _svZoom;
     _svApplyTransform();
@@ -4046,6 +5693,36 @@ _SIDEBAR_JS = """
   var _vfViewDrag = null;
   var _vfCurrentVar = null;
   var _vfDeadMode = false;
+  /* VFI-1: "split by scope" vs "merge by name". Default OFF = exact legacy
+   * behaviour (one identity per name). Persisted per browser. */
+  var _vfScopeSplit = (function(){ try { return localStorage.getItem('cg-vf-scope-split')==='1'; } catch(e){ return false; } })();
+  /* VFI-7: forward (downstream def-use) vs backward (upstream "where from?") flow
+   * direction. Default OFF = forward = exact legacy behaviour. Persisted per browser. */
+  var _vfBackwardFlow = (function(){ try { return localStorage.getItem('cg-vf-backward-flow')==='1'; } catch(e){ return false; } })();
+  var _vfCurrentScope = null;               /* selected scope id in split mode */
+  var _VF_SCOPE_SEP = '\u001f';             /* unit separator in composite dropdown keys */
+  function _vfScopeId(occ){ return (occ && (occ.scope_id || occ.function_id)) || ''; }
+  /* localStorage layout key — composite in split mode so per-scope layouts persist. */
+  function _vfLayoutKey(){ return _vfCurrentScope ? (_vfCurrentVar + _VF_SCOPE_SEP + _vfCurrentScope) : (_vfCurrentVar || ''); }
+  /* Distinct scope groups for a name key: [{scopeId, label, count, occ}] */
+  function _vfScopeGroups(nameKey){
+    var occs = VAR_FLOW_DATA[nameKey] || [];
+    var order = [], by = {};
+    occs.forEach(function(o){
+      var sid = _vfScopeId(o);
+      if (!by[sid]) { by[sid] = { scopeId: sid, count: 0, occ: o, label: '' }; order.push(sid); }
+      by[sid].count++;
+    });
+    return order.map(function(sid){
+      var g = by[sid];
+      if (sid === 'global') g.label = 'global';
+      else if (sid.indexOf('m:') === 0) g.label = 'member ' + sid.slice(2);
+      else if (sid.indexOf('f:') === 0) g.label = 'file ' + sid.slice(2).split('/').pop();
+      else if (sid.indexOf('t:') === 0) g.label = 'type ' + sid.slice(2);
+      else { var occ = g.occ; g.label = occ.function_name || sid; }
+      return g;
+    });
+  }
   var _vfAnnotMode = false;
   var _vfAnnotDrag = null;       /* active annotation drag state */
   var _vfAnnotResize = null;     /* active annotation resize state */
@@ -4069,6 +5746,18 @@ _SIDEBAR_JS = """
     _vfMultiSel = map || {};
     _vfApplyMultiSel();
   }
+  /* Nodes whose center lies inside a graph-space rect (for grip-drag bundling) */
+  function _vfNodesInRect(rx, ry, rw, rh) {
+    var out = [];
+    _vfCurrentNodes.forEach(function(nd){
+      var el = document.getElementById(nd.id);
+      var w = el ? el.offsetWidth : 300, h = el ? el.offsetHeight : 120;
+      var cx = nd.x + w/2, cy = nd.y + h/2;
+      if (cx >= rx && cx <= rx+rw && cy >= ry && cy <= ry+rh) out.push({id:nd.id, startNX:nd.x, startNY:nd.y});
+    });
+    return out;
+  }
+
   function _vfMoveAnnotsBy(dx, dy, selectedRect) {
     try {
       var ann = _vfAnnotsLoad();
@@ -4096,11 +5785,46 @@ _SIDEBAR_JS = """
     return m[action] || action;
   }
 
+  /* Dead-variable category → short badge label + tooltip. */
+  function _vfDeadCatLabel(cat) {
+    var m = {unused:'Unused', dead_store:'Dead Store', unused_param:'Unused Param',
+             dead_alloc:'Dead Alloc', unused_value:'Unused Value'};
+    return m[cat] || 'Dead Var';
+  }
+  /* Build the per-block dead/suppressed badge HTML from an occurrence record. */
+  function _vfDeadBadge(occ) {
+    if (occ.is_suppressed) {
+      var sr = occ.suppress_reason || 'intentionally unused';
+      return '<span class="cg-vf-dead-badge dv-suppressed" title="Suppressed: '+esc(sr)+'">Suppressed</span>';
+    }
+    if (!occ.is_dead) return '';
+    var cat  = occ.dead_category || (occ.action==='argument' ? 'unused_param' : 'unused');
+    var conf = occ.dead_confidence || 'high';
+    var lbl  = _vfDeadCatLabel(cat);
+    var rl = (occ.read_lines||[]).length, wl = (occ.write_lines||[]).length;
+    var why = 'read '+rl+'\u00d7'
+            + (occ.write_lines && occ.write_lines.length ? ' \u00b7 written '+wl+'\u00d7 @ L'+occ.write_lines.join(',L') : ' \u00b7 written '+wl+'\u00d7');
+    var tip = lbl + ' (' + conf + ' confidence) \u2014 ' + why
+            + (conf==='low' ? '  [best-effort]' : '');
+    var lowCls = (conf==='low') ? ' dv-lowconf' : '';
+    return '<span class="cg-vf-dead-badge dv-'+esc(cat)+lowCls+'" title="'+esc(tip)+'">'
+         + esc(lbl) + '<span class="dv-conf">'+esc(conf.charAt(0).toUpperCase())+'</span></span>';
+  }
+
   function _vfSourceKindExtra(sk) {
     if (sk === 'memory initialization') return 'memset init';
     if (sk === 'memory copy')           return 'memcpy dest';
     if (sk === 'memory copy source')    return 'memcpy src';
     return null;
+  }
+
+  /* VF-4: classify each occurrence into a display family for the filter panel. */
+  function _vfNodeFamily(occ) {
+    var sk = (occ && occ.source_kind) || '';
+    if (sk === 'custom_input') return 'lugasi';
+    if (sk === 'input_file_connect') return 'connect';
+    if (sk === 'member_access') return 'member';
+    return 'variable';
   }
 
   function _vfActionDescription(occ) {
@@ -4136,7 +5860,8 @@ _SIDEBAR_JS = """
     var keys = _VF_KEYS;
     var matches;
     if (!q) {
-      matches = keys.slice().sort(function(a,b){ return a.localeCompare(b); });
+      /* VF-8: empty query → sort hottest first */
+      matches = keys.slice().sort(function(a,b){ return (_VF_HOTSPOT[b]||0) - (_VF_HOTSPOT[a]||0) || a.localeCompare(b); });
     } else {
       matches = keys.filter(function(k){ return k.indexOf(q) !== -1; });
       matches.sort(function(a,b){
@@ -4146,12 +5871,29 @@ _SIDEBAR_JS = """
     }
     matches = matches.slice(0, 60);
     if (!matches.length) { dd.style.display='none'; return; }
-    dd.innerHTML = matches.map(function(k){
+    /* In split-by-scope mode, expand each name into its distinct scope groups. */
+    var items = [];
+    matches.forEach(function(k){
       var occs = VAR_FLOW_DATA[k];
-      var displayName = occs[0].name;
+      if (_vfScopeSplit) {
+        var groups = _vfScopeGroups(k);
+        if (groups.length > 1) {
+          groups.forEach(function(g){
+            items.push({ key: k + _VF_SCOPE_SEP + g.scopeId, name: g.occ.name,
+                         meta: g.label, count: g.count });
+          });
+          return;
+        }
+      }
       var fileSet = {};
       occs.forEach(function(o){ if(o.file_name) fileSet[o.file_name]=1; });
-      var fileList = Object.keys(fileSet).slice(0,3).join(', ');
+      items.push({ key: k, name: occs[0].name,
+                   meta: Object.keys(fileSet).slice(0,3).join(', '), count: occs.length });
+    });
+    items = items.slice(0, 80);
+    if (!items.length) { dd.style.display='none'; return; }
+    dd.innerHTML = items.map(function(it){
+      var displayName = it.name;
       var hi;
       if (!q) {
         hi = esc(displayName);
@@ -4161,19 +5903,25 @@ _SIDEBAR_JS = """
           ? esc(displayName.slice(0,idx))+'<span class="cg-vf-dd-mark">'+esc(displayName.slice(idx,idx+q.length))+'</span>'+esc(displayName.slice(idx+q.length))
           : esc(displayName);
       }
-      var cnt = occs.length;
-      return '<div class="cg-vf-dd-item" data-key="'+esc(k)+'">'
+      var cnt = it.count;
+      var score = _VF_HOTSPOT[it.key.split(_VF_SCOPE_SEP)[0]] || 0;
+      var hotBadge = (score >= _VF_HOTSPOT_P90 && _VF_HOTSPOT_MAX > 4)
+        ? '<span class="cg-vf-hot-badge" title="Hotspot: '+score+' score ('+cnt+' refs, '+Math.round(score/4)+' functions)">🔥</span>'
+        : '';
+      return '<div class="cg-vf-dd-item" data-key="'+esc(it.key)+'">'
+           + hotBadge
            + '<span class="cg-vf-dd-name">'+hi+'</span>'
-           + '<span class="cg-vf-dd-count" title="'+esc(fileList)+'">'+cnt+' loc'+(cnt===1?'':'s')+'</span>'
-           + (fileList?'<span style="font-size:10px;color:#6a7a8a;display:block;margin-top:1px">'+esc(fileList)+'</span>':'')
+           + '<span class="cg-vf-dd-count" title="'+esc(it.meta)+'">'+cnt+' loc'+(cnt===1?'':'s')+'</span>'
+           + (it.meta?'<span style="font-size:10px;color:#6a7a8a;display:block;margin-top:1px">'+esc(it.meta)+'</span>':'')
            + '</div>';
     }).join('');
     dd.querySelectorAll('.cg-vf-dd-item').forEach(function(item){
       item.addEventListener('mousedown', function(e){
         e.preventDefault();
         var k = item.dataset.key;
+        var namePart = k.split(_VF_SCOPE_SEP)[0];
         var inp2 = document.getElementById('cg-vf-search-input');
-        if (inp2) inp2.value = VAR_FLOW_DATA[k][0].name;
+        if (inp2) inp2.value = (VAR_FLOW_DATA[namePart] ? VAR_FLOW_DATA[namePart][0].name : namePart);
         dd.style.display = 'none';
         _vfSelectVar(k);
       });
@@ -4181,25 +5929,42 @@ _SIDEBAR_JS = """
     dd.style.display = 'block';
   }
 
-  /* Strip address-of / deref / cast / array index to get the base variable name */
-  function _extractBaseVarName(expr) {
+  /* Strip cast / address-of / deref / array index but KEEP the .field member
+   * path. `&cfg.speed` -> `cfg.speed`. Used so that a custom-input destination
+   * written to a struct member (e.g. LUGASI(&cfg.speed, ...)) keeps flowing
+   * when `cfg.speed` is later passed by value to a renamed parameter. */
+  function _extractFullVarName(expr) {
     if (!expr) return '';
     var s = expr.trim();
     s = s.replace(/^\\([^)]+\\)\\s*/, '');   /* strip cast */
     s = s.replace(/^[&*]+/, '');             /* strip & * */
     s = s.replace(/\\[.*$/, '');             /* strip [idx] */
     s = s.replace(/^[&*]+/, '');          /* strip again after cast removal */
+    return s.trim();
+  }
+
+  /* Strip address-of / deref / cast / array index to get the base variable name */
+  function _extractBaseVarName(expr) {
+    var s = _extractFullVarName(expr);
     s = s.replace(/\\.\\w+$/, '');        /* strip trailing .field access */
     return s.trim();
   }
 
   /*
-   * _vfBuildFlowChain(normKey)
-   * BFS from all occurrences of normKey, following argument→parameter mappings
-   * through EDGE_DATA call sites to discover aliased parameter names in callees.
+   * _vfBuildFlowChain(normKey, seedScopeId, direction)
+   * BFS from all occurrences of normKey.
+   *   direction = 'forward' (default, VFI-2): follow argument→parameter mappings
+   *     through EDGE_DATA call sites to discover aliased parameter names in callees
+   *     (downstream def-use).
+   *   direction = 'backward' (VFI-7): when the tracked variable is a callee
+   *     parameter, walk each caller's positional argument expression back to the
+   *     originating variable (upstream "where did this come from?"). Edge
+   *     orientation stays source→sink; only the traversal direction differs.
    * Returns { entries: [{occ, localName, origName}], flowEdges: [{fromFnId, fromVar, toFnId, toVar, edgeRef}] }
    */
-  function _vfBuildFlowChain(normKey) {
+  function _vfBuildFlowChain(normKey, seedScopeId, direction) {
+    direction = direction || (_vfBackwardFlow ? 'backward' : 'forward');
+    var _vfBackward = (direction === 'backward');
     /* Build param-name lookup: nodeId → [param0, param1, ...] */
     var nodeParamNames = {};
     NODE_DATA.forEach(function(nd) {
@@ -4229,6 +5994,9 @@ _SIDEBAR_JS = """
      * one block (the receiver), parented by the LUGASI block when present via the intra-fn
      * sort_priority 0 → 1 chain edge in _vfBuildGraph. */
     var rootOccs = VAR_FLOW_DATA[normKey] || [];
+    if (seedScopeId != null) {
+      rootOccs = rootOccs.filter(function(o){ return _vfScopeId(o) === seedScopeId; });
+    }
     var rootFns = {};
     rootOccs.forEach(function(occ) {
       if (!rootFns[occ.function_id]) {
@@ -4285,11 +6053,50 @@ _SIDEBAR_JS = """
       var fnId = item.fnId, varName = item.varName, origName = item.origName;
       var vlow = varName.toLowerCase();
 
+      if (_vfBackward) {
+        /* VFI-7 backward: if varName is a parameter of fnId, walk each caller's
+         * positional argument expression back to its originating variable. */
+        var myParms = nodeParamNames[fnId];
+        if (!myParms) continue;
+        var pk = -1;
+        for (var pi = 0; pi < myParms.length; pi++) {
+          if (myParms[pi] && myParms[pi].toLowerCase() === vlow) { pk = pi; break; }
+        }
+        if (pk < 0) continue;   /* not a parameter — origin reached on this path */
+        EDGE_DATA.forEach(function(e) {
+          if (e.to !== fnId || !e.args || pk >= e.args.length) return;
+          var argExpr = e.args[pk];
+          var baseB = _extractBaseVarName(argExpr);
+          var fullB = _extractFullVarName(argExpr);
+          /* prefer the full member path if it is a tracked variable, else base */
+          var srcName = (fullB && VAR_FLOW_DATA[fullB.toLowerCase()]) ? fullB : baseB;
+          if (!srcName) return;
+          var callerFn = e.from;
+          var slow = srcName.toLowerCase();
+          var edgeExistsB = flowEdges.some(function(fe) {
+            return fe.fromFnId===callerFn && fe.toFnId===fnId &&
+                   fe.fromVar.toLowerCase()===slow &&
+                   fe.toVar.toLowerCase()===vlow;
+          });
+          if (!edgeExistsB) {
+            flowEdges.push({ fromFnId: callerFn, fromVar: srcName,
+                             toFnId: fnId,       toVar: varName, edgeRef: e });
+          }
+          var toKeyB = callerFn + '::' + slow;
+          if (!visited[toKeyB]) {
+            addOccs(callerFn, srcName, origName);
+            queue.push({ fnId: callerFn, varName: srcName, origName: origName });
+          }
+        });
+        continue;
+      }
+
       EDGE_DATA.forEach(function(e) {
         if (e.from !== fnId || !e.args || !e.args.length) return;
         for (var j = 0; j < e.args.length; j++) {
           var base = _extractBaseVarName(e.args[j]);
-          if (base.toLowerCase() !== vlow) continue;
+          var full = _extractFullVarName(e.args[j]);
+          if (base.toLowerCase() !== vlow && full.toLowerCase() !== vlow) continue;
           /* varName is the j-th argument — find what the callee names it */
           var calleeParms = nodeParamNames[e.to];
           if (calleeParms && j < calleeParms.length && calleeParms[j]) {
@@ -4323,21 +6130,66 @@ _SIDEBAR_JS = """
       });
     }
 
+    /* VFI-3: Cross-variable assignment edges.
+     * After the main BFS, scan every reached entry for same-function assignment links:
+     * - upstream: occ.assign_src names another tracked var → add it and emit srcVar→thisVar.
+     * - downstream: ASSIGN_DST_INDEX[fnId::thisVar] lists vars assigned FROM thisVar → add
+     *   them and emit thisVar→dstVar.
+     * One-hop only (we add to entries but do NOT re-queue, so chains don't grow unboundedly). */
+    var _assignEdgeAdded = {};
+    function _emitAssignEdge(fromFnId, fromVar, toFnId, toVar) {
+      var k = fromFnId + '::' + fromVar.toLowerCase() + '→' + toFnId + '::' + toVar.toLowerCase();
+      if (_assignEdgeAdded[k]) return;
+      _assignEdgeAdded[k] = true;
+      flowEdges.push({ fromFnId: fromFnId, fromVar: fromVar,
+                       toFnId: toFnId,     toVar: toVar,
+                       link_kind: 'cross_var_assign' });
+    }
+    var _entriesSnap = entries.slice();  /* snapshot before addOccs may grow entries */
+    _entriesSnap.forEach(function(en) {
+      var fnId2  = en.occ.function_id;
+      var varKey2 = String(en.localName || en.occ.name || '').toLowerCase();
+      /* upstream: this occurrence was assigned FROM another tracked variable */
+      if (en.occ.assign_src) {
+        var srcKey = String(en.occ.assign_src).toLowerCase();
+        if (VAR_FLOW_DATA[srcKey]) {
+          if (!visited[fnId2 + '::' + srcKey]) addOccs(fnId2, srcKey, srcKey);
+          _emitAssignEdge(fnId2, srcKey, fnId2, varKey2);
+        }
+      }
+      /* downstream: other tracked vars that were assigned FROM this variable */
+      var idxKey2 = fnId2 + '::' + varKey2;
+      (ASSIGN_DST_INDEX[idxKey2] || []).forEach(function(item) {
+        var dstKey = item.dstKey;
+        if (!visited[fnId2 + '::' + dstKey]) addOccs(fnId2, dstKey, dstKey);
+        _emitAssignEdge(fnId2, varKey2, fnId2, dstKey);
+      });
+    });
+
     return { entries: entries, flowEdges: flowEdges };
   }
 
-  function _vfSelectVar(normKey) {
+  function _vfSelectVar(rawKey) {
+    /* rawKey may be a plain name key, or a composite "name<sep>scopeId"
+     * produced by the split-by-scope dropdown. */
+    var normKey = rawKey, scopeId = null;
+    var sep = rawKey.indexOf(_VF_SCOPE_SEP);
+    if (sep !== -1) { normKey = rawKey.slice(0, sep); scopeId = rawKey.slice(sep + 1); }
     _vfCurrentVar = normKey;
+    _vfCurrentScope = scopeId;
     /* Restore saved layout for this variable (or start with empty overrides) */
     _vfNodeOverrides = {};
-    try { var _vfRaw = localStorage.getItem(VF_LAYOUT_PFX + normKey); if (_vfRaw) _vfNodeOverrides = JSON.parse(_vfRaw); } catch(e) {}
+    var _layoutKey = _vfLayoutKey();
+    try { var _vfRaw = localStorage.getItem(VF_LAYOUT_PFX + _layoutKey); if (_vfRaw) _vfNodeOverrides = JSON.parse(_vfRaw); } catch(e) {}
     _vfSelectedEdgeIdx = null;
     var popup = document.getElementById('cg-edge-popup');
     if (popup) popup.style.display = 'none';
     if (!VAR_FLOW_DATA[normKey] || !VAR_FLOW_DATA[normKey].length) return;
+    /* VF-4: leaving aggregate family view — clear the action-button highlight. */
+    document.querySelectorAll('.cg-vf-fam-show-btn.active').forEach(function(b){ b.classList.remove('active'); });
     var ph = document.getElementById('cg-vf-placeholder');
     if (ph) ph.style.display = 'none';
-    var chain = _vfBuildFlowChain(normKey);
+    var chain = _vfBuildFlowChain(normKey, scopeId);
     _vfCurrentChainEdges = chain.flowEdges;
     _vfBuildGraph(chain.entries, chain.flowEdges);
   }
@@ -4500,6 +6352,7 @@ _SIDEBAR_JS = """
         + (showOrig ? '<span class="cg-vf-var-orig">(orig: '+esc(origName)+')</span>' : '');
       var varTitle = showOrig ? localName+' (originally: '+origName+')' : localName;
       var isDead = !!(occ.is_dead);
+      var isSuppressed = !!(occ.is_suppressed);
       var sk = occ.source_kind || '';
       var isConnect = (sk === 'input_file_connect');
       var isCustomInput = (sk === 'custom_input');
@@ -4514,9 +6367,7 @@ _SIDEBAR_JS = """
       var noteKey = _vfNoteKey(occ);
       var noteText = _vfGetNote(noteKey);
 
-      var deadBadge = isDead
-        ? '<span class="cg-vf-dead-badge" title="'+(occ.dead_reason||'unused')+'">'+
-          (occ.action==='argument'?'Unused Param':'Dead Var')+'</span>' : '';
+      var deadBadge = _vfDeadBadge(occ);
       /* ".connect" / "connect2" badge for connect-family receiver blocks */
       var connectBadge = isConnect
         ? '<span class="cg-vf-connect-badge">'
@@ -4539,28 +6390,26 @@ _SIDEBAR_JS = """
         ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Input</span>'
           +'<span class="cg-vf-info-val cg-vf-var-name">'+esc(occ.connect_input_name)+'</span></div>'
         : (isCustomInput && occ.connect_input_name
-          ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Source</span>'
+          ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Input</span>'
             +'<span class="cg-vf-info-val cg-vf-var-name">'+esc(occ.connect_input_name)+'</span></div>'
             +(occ.custom_input_func ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Func</span>'
             +'<span class="cg-vf-info-val" style="color:#4ec980">'+esc(occ.custom_input_func)+'</span></div>' : '')
           : '');
 
-      /* member_access: show parent + access expression in the body */
+      /* member_access: show parent object (the access expression itself is
+         already shown in full by the unified SOURCE row below). */
       var memberRows = '';
       if (isMemberAccess) {
         if (occ.parent_name) {
           memberRows += '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Parent</span>'
             + '<span class="cg-vf-info-val cg-vf-var-name" title="'+esc(occ.parent_name)+'">'+esc(occ.parent_name)+'</span></div>';
         }
-        if (occ.snippet) {
-          memberRows += '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Access</span>'
-            + '<span class="cg-vf-info-val" style="font-size:10px;color:#4fc3f7" title="'+esc(occ.snippet)+'">'+esc(occ.snippet)+'</span></div>';
-        }
       }
 
       var el = document.createElement('div');
       el.className = 'cg-vf-node'
         + (isDead ? ' cg-vf-dead' : '')
+        + (isSuppressed ? ' cg-vf-suppressed' : '')
         + (isConnect ? ' cg-vf-connect-input' : '')
         + (isCustomInput ? ' cg-vf-custom-input' : '')
         + (isMemberAccess ? ' cg-vf-member-access' : '');
@@ -4568,6 +6417,7 @@ _SIDEBAR_JS = """
       el.style.cssText = 'left:'+nd.x+'px;top:'+nd.y+'px;width:'+nd.w+'px;position:absolute';
       el.dataset.idx = nd.idx;
       el.dataset.notekey = noteKey;
+      el.dataset.family = _vfNodeFamily(occ);
       el.innerHTML =
         noteDot
         +'<div class="cg-vf-node-header">'
@@ -4592,9 +6442,15 @@ _SIDEBAR_JS = """
             +'<span class="cg-vf-info-label">File</span>'
             +'<span class="cg-vf-info-val cg-vf-file-val">'+ln+'</span>'
           +'</div>'
+          +(function(){ var _src = occ.full_source || occ.value; return _src
+            ? '<div class="cg-vf-info-row cg-vf-source-row">'
+                +'<span class="cg-vf-info-label">Source</span>'
+                +'<span class="cg-vf-info-val cg-vf-source-val" title="'+esc(_src)+'">'+esc(_src)+'</span>'
+              +'</div>'
+            : ''; })()
           +connectRow+inputNameRow+memberRows
         +'</div>'
-        +(occ.snippet ? '<div class="cg-vf-snippet" title="Double-click for details">'+esc(occ.snippet.trim())+'</div>' : '');
+        +(occ.doc_comment ? '<div class="cg-vf-doc-chip" title="' + esc(occ.doc_comment) + '">💬 ' + esc(occ.doc_comment) + '</div>' : '');
 
       el.addEventListener('click', function(e){ e.stopPropagation(); _vfNodeClick(nd.id); });
       el.addEventListener('dblclick', function(e){ e.stopPropagation(); _vfOpenModal(nd.occ); });
@@ -4633,6 +6489,10 @@ _SIDEBAR_JS = """
       });
       canvas.appendChild(el);
     });
+
+    /* PERF-8: virtualise VF node cards (edges below read each node's own
+       offsetHeight, which stays correct via the pinned intrinsic-size). */
+    _cgVirtualize(canvas, '.cg-vf-node');
 
     /* 9. Build edges: chain (cross-function data flow) + EDGE_DATA fallback + intra-fn sequential */
     var edgeSeen = {};
@@ -4680,6 +6540,8 @@ _SIDEBAR_JS = """
     chainEdges.forEach(function(ce) {
       var fg = fnEntries[ce.fromFnId], tg = fnEntries[ce.toFnId];
       if (!fg || !tg) return;
+      var isAssign = (ce.link_kind === 'cross_var_assign');
+      var edgeType = isAssign ? 'assign' : 'chain';
       // Source block — prefer name match, fall back to last in source function.
       var sourceItem = _pickByName(fg, ce.fromVar) || fg[fg.length-1];
       // Target block — prefer name match, then source_kind match, then first.
@@ -4690,8 +6552,11 @@ _SIDEBAR_JS = """
         }
       }
       if (!targetItem) targetItem = tg[0];
-      if (!_vfAllowEdge(sourceItem, targetItem)) return;
-      pushEdge('vfn_'+sourceItem.idx, 'vfn_'+targetItem.idx, 'chain');
+      /* Cross-var assign edges bypass the custom_input→connect constraint since
+       * they represent variable-to-variable data flow, not call-chain flow. */
+      if (!isAssign && !_vfAllowEdge(sourceItem, targetItem)) return;
+      if (!sourceItem || !targetItem) return;
+      pushEdge('vfn_'+sourceItem.idx, 'vfn_'+targetItem.idx, edgeType);
     });
 
     /* Fallback: EDGE_DATA between functions both in fnSet (covers same-name paths) */
@@ -4725,6 +6590,9 @@ _SIDEBAR_JS = """
     });
 
     _vfCurrentEdges = edges;
+
+    /* VF-4: apply family filter visibility after building nodes */
+    _vfApplyFamilyFilter();
 
     /* 10. Fit view — leave comfortable margin, cap at 1.0 so blocks aren't too large */
     var maxX = 0, maxY = 0;
@@ -4775,6 +6643,13 @@ _SIDEBAR_JS = """
     var nodeMap = {};
     nodes.forEach(function(n){ nodeMap[n.id]=n; });
 
+    /* VF-4: collect hidden nodes so we can skip their edges. */
+    var _hiddenNodes = {};
+    nodes.forEach(function(nd) {
+      var el2 = document.getElementById(nd.id);
+      if (el2 && el2.style.display === 'none') _hiddenNodes[nd.id] = true;
+    });
+
     _vfEdgeMeta = [];
     var seen = {};
     var visPaths = '';
@@ -4789,29 +6664,50 @@ _SIDEBAR_JS = """
       return id;
     }
 
+    var _isUpstreamHL = (_vfHighlightDirection === 'upstream');
+
     edges.forEach(function(e) {
       var k = e.from+'>'+e.to; if (seen[k]) return; seen[k] = true;
+      /* VF-4: skip edges involving hidden-family nodes */
+      if (_hiddenNodes[e.from] || _hiddenNodes[e.to]) return;
       var d = _vfEdgeGeometry(e, nodeMap);
       if (!d) return;
 
-      var typeClass = e.type==='same' ? 'cg-vf-edge-same' : 'cg-vf-edge-call';
+      var typeClass = e.type==='same'   ? 'cg-vf-edge-same'
+                    : e.type==='assign' ? 'cg-vf-edge-assign'
+                    :                     'cg-vf-edge-call';
       var css = 'cg-vf-edge ' + typeClass;
       /* Highlight the single selected edge (yellow, matching Function-mode edge-click style) */
       if (_vfSelectedEdgeIdx !== null && eidxCounter === _vfSelectedEdgeIdx) {
         css += ' vf-edge-selected';
       }
-      var mid = 'url(#vf-arr-' + (e.type==='same' ? 'same' : 'call') + ')';
+      var mid = 'url(#vf-arr-' + (e.type==='same' ? 'same' : e.type==='assign' ? 'assign' : 'call') + ')';
       var styleAttr = '';
       /* When a branch highlight is active, colour edges by the branch of the
-       * node they flow into; dim edges that are not part of the subgraph. */
+       * node they flow into (downstream) or flow from (upstream). */
       if (_vfBranchActive) {
-        var tcol = _vfBranchNodeColor[e.to];
-        var inSub = !!tcol && (e.from === _vfBranchOriginId || !!_vfBranchNodeColor[e.from]);
-        if (inSub) {
-          styleAttr = ' style="stroke:'+tcol+';opacity:1;stroke-width:2.5"';
-          mid = 'url(#' + _vfMarkerForColor(tcol) + ')';
+        if (_isUpstreamHL) {
+          /* VF-6 upstream: edge colour follows the source (from) node's colour.
+           * Edge is in-subgraph when its source is coloured AND its target is
+           * either the origin or also a coloured ancestor. */
+          var fcol = _vfBranchNodeColor[e.from];
+          var inSub = !!fcol && (e.to === _vfBranchOriginId || !!_vfBranchNodeColor[e.to]);
+          if (inSub) {
+            styleAttr = ' style="stroke:'+fcol+';opacity:1;stroke-width:2.5"';
+            mid = 'url(#' + _vfMarkerForColor(fcol) + ')';
+          } else {
+            styleAttr = ' style="opacity:0.12"';
+          }
         } else {
-          styleAttr = ' style="opacity:0.12"';
+          /* VF-2 downstream: original logic */
+          var tcol = _vfBranchNodeColor[e.to];
+          var inSub = !!tcol && (e.from === _vfBranchOriginId || !!_vfBranchNodeColor[e.from]);
+          if (inSub) {
+            styleAttr = ' style="stroke:'+tcol+';opacity:1;stroke-width:2.5"';
+            mid = 'url(#' + _vfMarkerForColor(tcol) + ')';
+          } else {
+            styleAttr = ' style="opacity:0.12"';
+          }
         }
       }
       var eidx = eidxCounter++;
@@ -4836,6 +6732,8 @@ _SIDEBAR_JS = """
       +'<path d="M0,1 L7,4 L0,7 Z" fill="#6c8ebf"/></marker>'
       +'<marker id="vf-arr-same" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">'
       +'<path d="M0,1 L7,4 L0,7 Z" fill="#6c8ebf"/></marker>'
+      +'<marker id="vf-arr-assign" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">'
+      +'<path d="M0,1 L7,4 L0,7 Z" fill="#e67e22"/></marker>'
       +branchMarkerDefs
       +'</defs>'
       + visPaths + hitPaths;
@@ -4874,8 +6772,9 @@ _SIDEBAR_JS = """
     var toVar   = (toNode   && toNode.en)   ? (toNode.en.localName   || toNode.occ.name)   : '?';
     var origName = (fromNode && fromNode.en) ? fromNode.en.origName : fromVar;
     var aliased  = fromVar.toLowerCase() !== toVar.toLowerCase();
-    var typeLabel = meta.type === 'same' ? 'intra-function sequence'
-                  : meta.type === 'chain' ? 'data-flow (variable renamed)'
+    var typeLabel = meta.type === 'same'   ? 'intra-function sequence'
+                  : meta.type === 'chain'  ? 'data-flow (variable renamed)'
+                  : meta.type === 'assign' ? 'cross-variable assignment'
                   : 'function call';
 
     var h = '<button class="cg-edge-close" onclick="cgCloseVfEdgePopup()" title="Close">&#x2715;</button>';
@@ -4912,6 +6811,11 @@ _SIDEBAR_JS = """
     canvas.querySelectorAll('.cg-vf-node.vf-selected').forEach(function(el){ el.classList.remove('vf-selected'); });
     var el = document.getElementById(nodeId);
     if (el) el.classList.add('vf-selected');
+    /* Flow-trace disabled → just select the block (lets the user drag freely). */
+    if (!window.cgTraceEnabled('varflow')) {
+      if (_vfBranchActive) _vfClearBranchHighlight();
+      return;
+    }
     /* VF-2: clicking the current branch origin again clears the highlight;
      * clicking any other node lights up its downstream flow per-branch. */
     if (_vfBranchActive && _vfBranchOriginId === nodeId) {
@@ -4920,6 +6824,13 @@ _SIDEBAR_JS = """
       _vfApplyBranchHighlight(nodeId);
     }
   }
+
+  /* VF enable toggle (mirrors the cross-mode trace checkbox). */
+  function _vfToggleTraceEnabled(on) {
+    window.cgTraceSetEnabled('varflow', on);
+    if (!on && _vfBranchActive) _vfClearBranchHighlight();
+  }
+  window._vfToggleTraceEnabled = _vfToggleTraceEnabled;
 
   /* ── Branch highlight engine (VF-2) ──────────────────────────
    * Colour every downstream path out of `originId`. Each immediate outgoing
@@ -4935,70 +6846,24 @@ _SIDEBAR_JS = """
   function _vfApplyBranchHighlight(originId) {
     if (!_vfCurrentNodes.length) return;
 
-    /* Build downstream adjacency (from -> [to]) over the current edge set. */
-    var out = {};
-    _vfCurrentEdges.forEach(function(e) {
-      if (!out[e.from]) out[e.from] = [];
-      if (out[e.from].indexOf(e.to) < 0) out[e.from].push(e.to);
-    });
+    var isUpstream = (_vfHighlightDirection === 'upstream');
 
-    var children = out[originId] || [];
-    if (!children.length) {
-      /* Leaf node — nothing downstream to colour. Just select it. */
+    /* Shared cross-mode engine computes per-branch colours + merge flags.
+     * (VF-2 downstream / VF-6 upstream — behaviour-identical to the previous
+     * inline implementation, now reused by every other mode too.) */
+    var trace = window.cgFlowTraceColors(originId, _vfCurrentEdges, _vfHighlightDirection);
+    var neighbors = trace.neighbors;
+    if (!neighbors.length) {
+      /* Leaf/root node — nothing in the selected direction. Just select it. */
       _vfClearBranchHighlight();
       var le = document.getElementById(originId);
       if (le) le.classList.add('vf-selected');
       return;
     }
 
-    var colorOf   = {};   /* nodeId -> hsl colour */
-    var hueOf      = {};   /* nodeId -> numeric hue (for marker grouping) */
-    var branchSet = {};   /* nodeId -> { branchIdx: true } for merge detection */
-    var visited   = {};   /* nodeId -> true once coloured */
-    var nBranch   = children.length;
-
-    function _recordBranch(id, bIdx) {
-      if (!branchSet[id]) branchSet[id] = {};
-      branchSet[id][bIdx] = true;
-    }
-    function _lightness(depth) { return Math.max(40, 64 - depth * 4); }
-
-    /* DFS stack seeded with one entry per immediate branch. */
-    var stack = [];
-    children.forEach(function(cid, i) {
-      stack.push({ id: cid, hue: i * (360 / nBranch), depth: 1, branchIdx: i });
-    });
-
-    while (stack.length) {
-      var cur = stack.pop();
-      _recordBranch(cur.id, cur.branchIdx);
-      if (visited[cur.id]) continue;   /* already coloured via another path → merge recorded */
-      visited[cur.id] = true;
-      hueOf[cur.id]   = cur.hue;
-      colorOf[cur.id] = _vfHsl(cur.hue, 68, _lightness(cur.depth));
-
-      var kids = (out[cur.id] || []).filter(function(k){ return k !== originId; });
-      var k = kids.length;
-      kids.forEach(function(kid, j) {
-        /* Derive child hue: when this node splits, fan the children out around
-         * the parent hue; the fan shrinks with depth so deeper layers stay near
-         * their ancestor's colour. Single-child chains keep the same hue. */
-        var childHue = (k > 1)
-          ? cur.hue + (j - (k - 1) / 2) * (30 / cur.depth)
-          : cur.hue;
-        if (!visited[kid]) {
-          stack.push({ id: kid, hue: childHue, depth: cur.depth + 1, branchIdx: cur.branchIdx });
-        } else {
-          _recordBranch(kid, cur.branchIdx);
-        }
-      });
-    }
-
-    /* Merge points: reached from more than one immediate branch. */
-    var merge = {};
-    Object.keys(branchSet).forEach(function(id) {
-      if (Object.keys(branchSet[id]).length > 1) merge[id] = true;
-    });
+    var colorOf = trace.color;
+    var merge   = trace.merge;
+    var nBranch = trace.nBranch;
 
     _vfBranchActive    = true;
     _vfBranchOriginId  = originId;
@@ -5026,7 +6891,7 @@ _SIDEBAR_JS = """
       }
     });
 
-    _vfRenderBranchLegend(children, nBranch);
+    _vfRenderBranchLegend(neighbors, nBranch, isUpstream);
     _vfDrawEdges(_vfCurrentEdges, _vfCurrentNodes);
   }
 
@@ -5048,7 +6913,7 @@ _SIDEBAR_JS = """
     _vfDrawEdges(_vfCurrentEdges, _vfCurrentNodes);
   }
 
-  function _vfRenderBranchLegend(children, nBranch) {
+  function _vfRenderBranchLegend(children, nBranch, isUpstream) {
     var area = document.getElementById('cg-vf-graph-area');
     if (!area) return;
     var lg = document.getElementById('cg-vf-legend');
@@ -5068,11 +6933,16 @@ _SIDEBAR_JS = """
             + '<span class="cg-vf-legend-swatch" style="background:' + col + '"></span>'
             + '<span title="' + esc(fn) + '">' + esc(lbl) + '</span></div>';
     });
+    var title = isUpstream
+      ? 'Upstream sources (' + nBranch + ')'
+      : 'Flow branches (' + nBranch + ')';
+    var hint = isUpstream
+      ? 'Each colour is one upstream source path. Dashed = confluence point (merges from multiple sources). Deeper chains shade the ancestor colour.'
+      : 'Each colour is one downstream path. Dashed = merge point (shared by paths). Deeper splits shade the parent colour.';
     lg.innerHTML =
-      '<div class="cg-vf-legend-title">Flow branches (' + nBranch + ')</div>'
+      '<div class="cg-vf-legend-title">' + title + '</div>'
       + rows
-      + '<div class="cg-vf-legend-hint">Each colour is one downstream path. '
-      + 'Dashed = merge point (shared by paths). Deeper splits shade the parent colour.</div>'
+      + '<div class="cg-vf-legend-hint">' + hint + '</div>'
       + '<button class="cg-vf-legend-clear" type="button">Clear highlight</button>';
     var clr = lg.querySelector('.cg-vf-legend-clear');
     if (clr) clr.addEventListener('click', function(ev){ ev.stopPropagation(); _vfClearBranchHighlight(); });
@@ -5088,11 +6958,12 @@ _SIDEBAR_JS = """
     var typeTxt = occ.data_type || occ.type_hint || 'unknown';
     var ln      = (occ.file_name||'') + (occ.line ? ':'+occ.line : '');
     var actionDesc = _vfActionDescription(occ);
-    var valueRow = occ.value
-      ? '<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Source line</span><span class="cg-vf-modal-value mono">'+esc(occ.value)+'</span></div>'
-      : '';
-    var snippetSec = occ.snippet
-      ? '<div class="cg-vf-modal-section"><div class="cg-vf-modal-section-title">Source code</div><div class="cg-vf-modal-code">'+esc(occ.snippet.trim())+'</div></div>'
+    /* Unified source line: prefer the full statement, fall back to the RHS
+       value, then the short context snippet. Shown once as a "Source" section. */
+    var srcLine = occ.full_source || occ.value || (occ.snippet ? occ.snippet.trim() : '');
+    var valueRow = '';
+    var snippetSec = srcLine
+      ? '<div class="cg-vf-modal-section"><div class="cg-vf-modal-section-title">Source</div><div class="cg-vf-modal-code">'+esc(srcLine)+'</div></div>'
       : '';
     var localName = occ._localName || occ.name;
     var origName  = occ._origName  || occ.name;
@@ -5135,7 +7006,11 @@ _SIDEBAR_JS = """
         +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Full path</span><span class="cg-vf-modal-value mono" style="color:#4A90D9">'+esc(occ.connect_path)+'</span></div>'
         +(occ.connect_input_name?'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Input var</span><span class="cg-vf-modal-value mono">'+esc(occ.connect_input_name)+'</span></div>':'')
         +'</div>' : '')
-      +snippetSec;
+      +snippetSec
+      +(occ.doc_comment ? '<div class="cg-vf-modal-section" style="border-left:3px solid #5a8a4a">'
+        +'<div class="cg-vf-modal-section-title" style="color:#7abc5a">💬 Source Comment</div>'
+        +'<div class="cg-vf-modal-action-desc" style="white-space:pre-wrap;font-style:italic">'+esc(occ.doc_comment)+'</div>'
+        +'</div>' : '');
     modal.classList.add('open');
   }
 
@@ -5203,12 +7078,12 @@ _SIDEBAR_JS = """
 
   function _vfResetLayout() {
     _vfNodeOverrides   = {};
-    try { localStorage.removeItem(VF_LAYOUT_PFX + (_vfCurrentVar||'')); } catch(e) {}
+    try { localStorage.removeItem(VF_LAYOUT_PFX + _vfLayoutKey()); } catch(e) {}
     _vfSelectedEdgeIdx = null;
     var popup = document.getElementById('cg-edge-popup');
     if (popup) popup.style.display = 'none';
     if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
-      var chain = _vfBuildFlowChain(_vfCurrentVar);
+      var chain = _vfBuildFlowChain(_vfCurrentVar, _vfCurrentScope);
       _vfCurrentChainEdges = chain.flowEdges;
       _vfBuildGraph(chain.entries, chain.flowEdges);
     }
@@ -5244,9 +7119,23 @@ _SIDEBAR_JS = """
     if (!matches.length){dd.style.display='none';return;}
     var rect=inp.getBoundingClientRect();
     dd.style.cssText='left:'+Math.round(rect.left)+'px;top:'+Math.round(rect.bottom+2)+'px;width:'+Math.round(rect.width)+'px;';
-    dd.innerHTML=matches.map(function(k){
-      var displayName=VAR_FLOW_DATA[k][0].name;
-      var cnt=VAR_FLOW_DATA[k].length;
+    /* Split-by-scope expansion (VFI-1) */
+    var items=[];
+    matches.forEach(function(k){
+      if (_vfScopeSplit) {
+        var groups=_vfScopeGroups(k);
+        if (groups.length>1) {
+          groups.forEach(function(g){
+            items.push({ vkey:k+_VF_SCOPE_SEP+g.scopeId, name:g.occ.name, meta:g.label, count:g.count });
+          });
+          return;
+        }
+      }
+      items.push({ vkey:k, name:VAR_FLOW_DATA[k][0].name, meta:'', count:VAR_FLOW_DATA[k].length });
+    });
+    items=items.slice(0,60);
+    dd.innerHTML=items.map(function(it){
+      var displayName=it.name;
       var hi;
       if (!norm) {
         hi=esc(displayName);
@@ -5256,24 +7145,42 @@ _SIDEBAR_JS = """
           ?esc(displayName.slice(0,idx))+'<span class="cg-sd-mark">'+esc(displayName.slice(idx,idx+norm.length))+'</span>'+esc(displayName.slice(idx+norm.length))
           :esc(displayName);
       }
-      return '<div class="cg-sd-item" data-vkey="'+esc(k)+'">'
+      var metaTxt=(it.meta?esc(it.meta)+' · ':'')+it.count+' occurrence'+(it.count===1?'':'s');
+      return '<div class="cg-sd-item" data-vkey="'+esc(it.vkey)+'">'
         +'<div class="cg-sd-name">'+hi+'</div>'
-        +'<div class="cg-sd-meta">'+cnt+' occurrence'+(cnt===1?'':'s')+'</div>'
+        +'<div class="cg-sd-meta">'+metaTxt+'</div>'
         +'</div>';
     }).join('');
     dd.querySelectorAll('.cg-sd-item').forEach(function(item){
       item.addEventListener('mousedown',function(e){
         e.preventDefault();
         var vkey=item.dataset.vkey;
+        var namePart=vkey.split(_VF_SCOPE_SEP)[0];
+        var occs=VAR_FLOW_DATA[namePart];
         dd.style.display='none';
-        if (inp) inp.value=VAR_FLOW_DATA[vkey][0].name;
+        if (inp&&occs) inp.value=occs[0].name;
         var vfInp=document.getElementById('cg-vf-search-input');
-        if (vfInp) vfInp.value=VAR_FLOW_DATA[vkey][0].name;
-        if (searchHint) searchHint.textContent=VAR_FLOW_DATA[vkey].length+' occurrence'+(VAR_FLOW_DATA[vkey].length===1?'':'s');
+        if (vfInp&&occs) vfInp.value=occs[0].name;
+        if (searchHint&&occs) searchHint.textContent=occs.length+' occurrence'+(occs.length===1?'':'s');
         _vfSelectVar(vkey);
       });
     });
     dd.style.display='block';
+  }
+
+  /* VF-4: show/hide nodes by family; refresh edges to exclude hidden endpoints. */
+  function _vfApplyFamilyFilter() {
+    var hiddenIds = {};
+    _vfCurrentNodes.forEach(function(nd) {
+      var el = document.getElementById(nd.id);
+      if (!el) return;
+      var fam = el.dataset.family || 'variable';
+      var visible = !!_vfFamilyFilter[fam];
+      el.style.display = visible ? '' : 'none';
+      if (!visible) hiddenIds[nd.id] = true;
+    });
+    /* Refresh edges so hidden-endpoint edges disappear */
+    _vfDrawEdges(_vfCurrentEdges, _vfCurrentNodes);
   }
 
   function _vfRebuildEdges() {
@@ -5393,6 +7300,62 @@ _SIDEBAR_JS = """
   (function(){
     var inp=document.getElementById('cg-vf-search-input');
     if(!inp) return;
+    /* Reflect persisted split-by-scope state on the toolbar button (VFI-1). */
+    var scopeBtn=document.getElementById('cg-vf-scope-btn');
+    if(scopeBtn) scopeBtn.classList.toggle('active', _vfScopeSplit);
+    /* Reflect persisted flow-direction state on the toolbar button (VFI-7). */
+    var backwardBtn=document.getElementById('cg-vf-backward-btn');
+    if(backwardBtn){
+      backwardBtn.classList.toggle('active', _vfBackwardFlow);
+      backwardBtn.textContent = _vfBackwardFlow ? '\u2b9c Backward' : '\u2b9e Forward';
+    }
+    /* VF-6: reflect persisted highlight-direction state. */
+    var hldirBtn=document.getElementById('cg-vf-hldir-btn');
+    if(hldirBtn){
+      var _isUpHL = (_vfHighlightDirection === 'upstream');
+      hldirBtn.classList.toggle('active', _isUpHL);
+      hldirBtn.textContent = _isUpHL ? '\u2b9d Upstream' : '\u2b9f Downstream';
+    }
+    /* Reflect persisted flow-trace enable flag on the VF checkbox. */
+    var _vfTraceCb = document.getElementById('cg-vf-trace-cb');
+    if (_vfTraceCb) _vfTraceCb.checked = window.cgTraceEnabled('varflow');
+    /* VF-4: reflect persisted family filter state on the pill buttons. */
+    document.querySelectorAll('.cg-vf-fam-btn').forEach(function(btn) {
+      var fam = btn.dataset.fam;
+      if (fam) btn.classList.toggle('active', !!_vfFamilyFilter[fam]);
+    });
+    /* VF-4: derive the custom-input ("lugasi") show-button label from the
+     * function names the C parser actually emitted, so renaming those custom
+     * functions in the parser updates the UI automatically — the renamed name
+     * is never hard-coded in the renderer. The button is hidden when the
+     * project has no custom-input blocks at all. */
+    var _ciNames = _vfFamilyFuncNames('custom_input');
+    var _ciBtn = document.querySelector('.cg-vf-fam-show-btn[data-fam="lugasi"]');
+    if (_ciBtn) {
+      var _ciLbl = _ciNames.length ? _ciNames.join(' / ') : 'Custom input';
+      var _ciSpan = _ciBtn.querySelector('.cg-vf-fam-show-lbl');
+      if (_ciSpan) _ciSpan.textContent = _ciLbl;
+      _ciBtn.title = 'Show every ' + _ciLbl + ' source block and its downstream flow';
+      _ciBtn.style.display = _ciNames.length ? '' : 'none';
+    }
+    /* Connect button: prefer the connect2-style free-function names when present,
+     * otherwise the generic ".connect" method label. Hidden when no connect blocks. */
+    var _coNames = _vfFamilyFuncNames('input_file_connect');
+    var _coHasAny = (function(){
+      for (var i=0;i<_VF_KEYS.length;i++){
+        var occs=VAR_FLOW_DATA[_VF_KEYS[i]]||[];
+        for (var j=0;j<occs.length;j++){ if((occs[j].source_kind||'')==='input_file_connect') return true; }
+      }
+      return false;
+    })();
+    var _coBtn = document.querySelector('.cg-vf-fam-show-btn[data-fam="connect"]');
+    if (_coBtn) {
+      var _coSpan = _coBtn.querySelector('.cg-vf-fam-show-lbl');
+      var _coLbl = _coNames.length ? _coNames.join(' / ') : '.connect';
+      if (_coSpan) _coSpan.textContent = _coLbl;
+      _coBtn.title = 'Show every ' + _coLbl + ' input block and its downstream flow';
+      _coBtn.style.display = _coHasAny ? '' : 'none';
+    }
     inp.addEventListener('focus', _vfSearch);
     inp.addEventListener('input', _vfSearch);
     inp.addEventListener('blur', function(){
@@ -5439,6 +7402,134 @@ _SIDEBAR_JS = """
     return dead;
   }
 
+  window._vfToggleScopeSplit = function() {
+    _vfScopeSplit = !_vfScopeSplit;
+    try { localStorage.setItem('cg-vf-scope-split', _vfScopeSplit ? '1' : '0'); } catch(e) {}
+    var btn = document.getElementById('cg-vf-scope-btn');
+    if (btn) btn.classList.toggle('active', _vfScopeSplit);
+    /* Re-render the current selection under the new grouping for instant feedback. */
+    if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
+      if (_vfScopeSplit) {
+        var groups = _vfScopeGroups(_vfCurrentVar);
+        var sid = null;
+        if (_vfCurrentScope && groups.some(function(g){ return g.scopeId === _vfCurrentScope; })) sid = _vfCurrentScope;
+        else if (groups.length) sid = groups[0].scopeId;
+        _vfSelectVar(sid != null ? _vfCurrentVar + _VF_SCOPE_SEP + sid : _vfCurrentVar);
+      } else {
+        _vfCurrentScope = null;
+        _vfSelectVar(_vfCurrentVar);
+      }
+    }
+  };
+
+  window._vfToggleBackwardFlow = function() {
+    _vfBackwardFlow = !_vfBackwardFlow;
+    try { localStorage.setItem('cg-vf-backward-flow', _vfBackwardFlow ? '1' : '0'); } catch(e) {}
+    var btn = document.getElementById('cg-vf-backward-btn');
+    if (btn) {
+      btn.classList.toggle('active', _vfBackwardFlow);
+      btn.textContent = _vfBackwardFlow ? '\u2b9c Backward' : '\u2b9e Forward';
+    }
+    /* Re-render the current selection under the new direction for instant feedback. */
+    if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
+      _vfSelectVar(_vfCurrentScope != null ? _vfCurrentVar + _VF_SCOPE_SEP + _vfCurrentScope : _vfCurrentVar);
+    }
+  };
+
+
+  /* VF-6: toggle click-highlight direction (downstream ↔ upstream). */
+  window._vfToggleHighlightDirection = function() {
+    _vfHighlightDirection = (_vfHighlightDirection === 'upstream') ? 'downstream' : 'upstream';
+    try { localStorage.setItem('cg-vf-highlight-dir', _vfHighlightDirection); } catch(e) {}
+    var btn = document.getElementById('cg-vf-hldir-btn');
+    if (btn) {
+      var isUp = (_vfHighlightDirection === 'upstream');
+      btn.classList.toggle('active', isUp);
+      btn.textContent = isUp ? '\u2b9d Upstream' : '\u2b9f Downstream';
+    }
+    /* Re-apply highlight in new direction if one is active */
+    if (_vfBranchActive && _vfBranchOriginId) {
+      _vfApplyBranchHighlight(_vfBranchOriginId);
+    }
+  };
+
+  /* VF-4: toggle visibility of a node family (Variable / Member only — the
+   * LUGASI/.connect families are driven by the "All flows" action buttons,
+   * see _vfShowFamily). */
+  window._vfToggleFamilyFilter = function(fam) {
+    _vfFamilyFilter[fam] = !_vfFamilyFilter[fam];
+    try { localStorage.setItem('cg-vf-family-filter', JSON.stringify(_vfFamilyFilter)); } catch(e) {}
+    var btn = document.querySelector('.cg-vf-fam-btn[data-fam="' + fam + '"]');
+    if (btn) btn.classList.toggle('active', _vfFamilyFilter[fam]);
+    _vfApplyFamilyFilter();
+  };
+
+  /* VF-4: distinct parser-emitted function names for a source family. Used to
+   * label the "All flows" buttons without baking the custom function name into
+   * the renderer (the names come straight from the analysed code). */
+  function _vfFamilyFuncNames(targetKind) {
+    var seen = {}, order = [];
+    _VF_KEYS.forEach(function(k){
+      (VAR_FLOW_DATA[k] || []).forEach(function(occ){
+        if ((occ.source_kind || '') === targetKind && occ.custom_input_func && !seen[occ.custom_input_func]) {
+          seen[occ.custom_input_func] = true; order.push(occ.custom_input_func);
+        }
+      });
+    });
+    return order;
+  }
+
+  /* VF-4: show EVERY block of a source family together with its downstream flow,
+   * aggregated into one graph. fam: 'lugasi' (custom_input) | 'connect' (input_file_connect). */
+  window._vfShowFamily = function(fam) {
+    var targetKind = (fam === 'connect') ? 'input_file_connect' : 'custom_input';
+    var seedKeys = {};
+    _VF_KEYS.forEach(function(k){
+      (VAR_FLOW_DATA[k] || []).forEach(function(occ){
+        if ((occ.source_kind || '') === targetKind) seedKeys[k] = true;
+      });
+    });
+    var keys = Object.keys(seedKeys);
+    var ph = document.getElementById('cg-vf-placeholder');
+    var canvas = document.getElementById('cg-vf-canvas');
+    if (!keys.length) {
+      var none = (fam === 'connect')
+        ? (_vfFamilyFuncNames('input_file_connect').join(' / ') || '.connect')
+        : (_vfFamilyFuncNames('custom_input').join(' / ') || 'custom input');
+      if (canvas) canvas.innerHTML = '<svg id="cg-vf-svg" width="1" height="1" style="position:absolute;top:0;left:0;overflow:visible;pointer-events:none"></svg>';
+      if (ph) { ph.textContent = 'No ' + none + ' blocks found in this project.'; ph.style.display = ''; }
+      return;
+    }
+    if (ph) ph.style.display = 'none';
+    /* Leave dead mode if it was on. */
+    if (_vfDeadMode) {
+      _vfDeadMode = false;
+      var dbtn = document.getElementById('cg-vf-dead-btn');
+      if (dbtn) dbtn.classList.remove('active');
+    }
+    /* Aggregate mode — no single current variable. */
+    _vfCurrentVar = null; _vfCurrentScope = null; _vfNodeOverrides = {};
+    _vfSelectedEdgeIdx = null;
+    var allEntries = [], allEdges = [], seenEntry = {};
+    keys.forEach(function(k){
+      var chain = _vfBuildFlowChain(k, null);   /* respects the Forward/Backward toggle */
+      chain.entries.forEach(function(en){
+        var o = en.occ;
+        var ek = (o.function_id||'') + '|' + (o.line||'') + '|' + (o.name||'') + '|' + (o.source_kind||'');
+        if (seenEntry[ek]) return;
+        seenEntry[ek] = true;
+        allEntries.push(en);
+      });
+      chain.flowEdges.forEach(function(e){ allEdges.push(e); });
+    });
+    _vfCurrentChainEdges = allEdges;
+    _vfBuildGraph(allEntries, allEdges);
+    /* Mark which family action is active. */
+    document.querySelectorAll('.cg-vf-fam-show-btn').forEach(function(b){
+      b.classList.toggle('active', b.dataset.fam === fam);
+    });
+  };
+
   window._vfToggleDeadMode = function() {
     _vfDeadMode = !_vfDeadMode;
     var btn = document.getElementById('cg-vf-dead-btn');
@@ -5452,7 +7543,7 @@ _SIDEBAR_JS = """
       var ph = document.getElementById('cg-vf-placeholder');
       if (ph) ph.style.display = _vfCurrentVar ? 'none' : '';
       if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
-        var chain = _vfBuildFlowChain(_vfCurrentVar);
+        var chain = _vfBuildFlowChain(_vfCurrentVar, _vfCurrentScope);
         _vfCurrentChainEdges = chain.flowEdges;
         _vfBuildGraph(chain.entries, chain.flowEdges);
       }
@@ -5468,6 +7559,8 @@ _SIDEBAR_JS = """
     }
     var ph = document.getElementById('cg-vf-placeholder');
     if (ph) ph.style.display = 'none';
+    /* VF-4: leaving aggregate family view — clear the action-button highlight. */
+    document.querySelectorAll('.cg-vf-fam-show-btn.active').forEach(function(b){ b.classList.remove('active'); });
     /* Build synthetic entries — each dead occ becomes its own block */
     var entries = occs.map(function(occ) {
       return { occ: occ, localName: occ.name, origName: occ.name };
@@ -5480,20 +7573,40 @@ _SIDEBAR_JS = """
     var modal = document.getElementById('cg-dead-modal');
     var body  = document.getElementById('cg-dead-modal-body');
     if (!modal || !body) return;
-    var h = '<div class="cg-dead-hdr">'
-      +'<span>Variable</span><span>Function</span><span>Line</span>'
-      +'<span>Type</span><span>Reason</span></div>';
+
+    /* group by dead_category */
+    var ORDER = ['unused','dead_store','unused_param','dead_alloc','unused_value'];
+    var groups = {};
+    dead.forEach(function(occ){
+      var c = occ.dead_category || (occ.action==='argument' ? 'unused_param' : 'unused');
+      (groups[c] = groups[c] || []).push(occ);
+    });
+    var h = '';
     if (!dead.length) {
       h += '<div style="padding:18px;color:#5a6a7a;font-size:12px">No dead variables detected.</div>';
     } else {
-      dead.forEach(function(occ) {
-        h += '<div class="cg-dead-row">'
-          +'<span class="cg-dead-name">'+esc(occ.name)+'</span>'
-          +'<span class="cg-dead-fn" title="'+esc(occ.function_name)+'">'+esc(occ.function_name)+'</span>'
-          +'<span class="cg-dead-line">'+esc((occ.file_name||'')+(occ.line?':'+occ.line:''))+'</span>'
-          +'<span class="cg-dead-type">'+esc(occ.data_type||occ.type_hint||'—')+'</span>'
-          +'<span class="cg-dead-why">'+esc(occ.dead_reason||'unused')+'</span>'
-          +'</div>';
+      ORDER.forEach(function(cat){
+        var rows = groups[cat];
+        if (!rows || !rows.length) return;
+        h += '<div class="cg-dead-cat-hdr"><span class="cg-vf-dead-badge dv-'+esc(cat)
+           + '">'+esc(_vfDeadCatLabel(cat))+'</span><span class="cg-dead-cat-n">'+rows.length+'</span></div>';
+        h += '<div class="cg-dead-hdr">'
+          +'<span>Variable</span><span>Function</span><span>Line</span>'
+          +'<span>Conf</span><span>Why</span></div>';
+        rows.forEach(function(occ){
+          var conf = occ.dead_confidence || 'high';
+          var rl = (occ.read_lines||[]).length, wl = (occ.write_lines||[]).length;
+          var why = 'read '+rl+'\u00d7 \u00b7 written '+wl+'\u00d7'
+                  + (occ.write_lines && occ.write_lines.length ? ' @ L'+occ.write_lines.join(',L') : '');
+          h += '<div class="cg-dead-row">'
+            +'<span class="cg-dead-name">'+esc(occ.name)+'</span>'
+            +'<span class="cg-dead-fn" title="'+esc(occ.function_name)+'">'+esc(occ.function_name)+'</span>'
+            +'<span class="cg-dead-line">'+esc((occ.file_name||'')+(occ.line?':'+occ.line:''))+'</span>'
+            +'<span class="cg-dead-conf cg-dead-conf-'+esc(conf)+'">'+esc(conf)
+              +(conf==='low'?' \u2248':'')+'</span>'
+            +'<span class="cg-dead-why" title="'+esc(why)+'">'+esc(why)+'</span>'
+            +'</div>';
+        });
       });
     }
     body.innerHTML = h;
@@ -5509,7 +7622,7 @@ _SIDEBAR_JS = """
 
   function _vfUpdateDeadCount() {
     var dead = _vfDeadVarOccs();
-    var params = dead.filter(function(o){ return o.action==='argument' || o.dead_reason==='unused parameter'; });
+    var params = dead.filter(function(o){ return o.dead_category==='unused_param' || o.action==='argument' || o.dead_reason==='unused parameter'; });
     var vars   = dead.length - params.length;
     var cv = document.getElementById('cg-dead-count');
     var cp = document.getElementById('cg-dead-param-count');
@@ -5571,7 +7684,7 @@ _SIDEBAR_JS = """
       /* Refresh current graph to show/hide note dot */
       if (_vfDeadMode) { _vfShowDeadVars(); }
       else if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
-        var chain = _vfBuildFlowChain(_vfCurrentVar);
+        var chain = _vfBuildFlowChain(_vfCurrentVar, _vfCurrentScope);
         _vfBuildGraph(chain.entries, chain.flowEdges);
       }
     }
@@ -5586,7 +7699,7 @@ _SIDEBAR_JS = """
       if (menu._occ) { _vfSetNote(_vfNoteKey(menu._occ),''); }
       if (_vfDeadMode) { _vfShowDeadVars(); }
       else if (_vfCurrentVar && VAR_FLOW_DATA[_vfCurrentVar]) {
-        var chain = _vfBuildFlowChain(_vfCurrentVar);
+        var chain = _vfBuildFlowChain(_vfCurrentVar, _vfCurrentScope);
         _vfBuildGraph(chain.entries, chain.flowEdges);
       }
     });
@@ -5619,6 +7732,8 @@ _SIDEBAR_JS = """
     if (btn) btn.classList.toggle('active', _vfAnnotMode);
     var vp = document.getElementById('cg-vf-viewport');
     if (vp) vp.style.cursor = _vfAnnotMode ? 'crosshair' : '';
+    var canvas = document.getElementById('cg-vf-canvas');
+    if (canvas) canvas.classList.toggle('annot-mode-active', _vfAnnotMode);
   };
 
   function _vfRenderAnnots() {
@@ -5639,6 +7754,7 @@ _SIDEBAR_JS = """
     el.style.cssText = 'left:'+a.x+'px;top:'+a.y+'px;width:'+a.w+'px;height:'+a.h+'px;';
     _annotApplyColor(el, a.color);
     el.innerHTML = '<div class="cg-vf-annot-label" style="font-size:'+(a.fontSize||16)+'px">'+esc(a.label||'')+'</div>'
+      +'<div class="cg-vf-annot-grip" title="Drag annotation (+ nodes inside)"></div>'
       +'<button class="cg-vf-annot-del" title="Delete annotation">\xd7</button>'
       +'<div class="cg-vf-annot-resize" title="Resize"></div>';
     el.querySelector('.cg-vf-annot-del').addEventListener('click', function(e){
@@ -5665,12 +7781,14 @@ _SIDEBAR_JS = """
         }
       });
     });
-    /* Drag to move */
+    /* Drag to move — fires from grip (outside annot-mode) or body (in annot-mode);
+       body is click-through to nodes underneath, grip stays grabbable */
     el.addEventListener('mousedown', function(e){
       if (e.target.classList.contains('cg-vf-annot-del') || e.target.classList.contains('cg-vf-annot-resize')) return;
       if (e.button !== 0) return;
       e.stopPropagation();
-      _vfAnnotDrag = {idx:idx, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y};
+      _vfAnnotDrag = {idx:idx, el:el, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y,
+                      moved:false, nodes:_vfNodesInRect(a.x, a.y, a.w, a.h)};
     });
     /* Resize handle */
     el.querySelector('.cg-vf-annot-resize').addEventListener('mousedown', function(e){
@@ -5702,12 +7820,28 @@ _SIDEBAR_JS = """
 
       document.addEventListener('mousemove', function(e){
         if (_vfAnnotDrag) {
+          var dx=e.clientX-_vfAnnotDrag.startMX, dy=e.clientY-_vfAnnotDrag.startMY;
+          if (!_vfAnnotDrag.moved && (Math.abs(dx)>4||Math.abs(dy)>4)) _vfAnnotDrag.moved=true;
+          if (_vfAnnotDrag.moved) {
+          var gdx=(e.clientX-_vfAnnotDrag.startMX)/_vfZoom, gdy=(e.clientY-_vfAnnotDrag.startMY)/_vfZoom;
           var annots = _vfAnnotsLoad();
           if (annots[_vfAnnotDrag.idx]) {
-            annots[_vfAnnotDrag.idx].x = _vfAnnotDrag.startX + (e.clientX-_vfAnnotDrag.startMX)/_vfZoom;
-            annots[_vfAnnotDrag.idx].y = _vfAnnotDrag.startY + (e.clientY-_vfAnnotDrag.startMY)/_vfZoom;
+            annots[_vfAnnotDrag.idx].x = _vfAnnotDrag.startX + gdx;
+            annots[_vfAnnotDrag.idx].y = _vfAnnotDrag.startY + gdy;
             _vfAnnotsSave(annots);
             _vfRenderAnnots();
+          }
+          var nlist = _vfAnnotDrag.nodes || [];
+          if (nlist.length) {
+            nlist.forEach(function(it){
+              var nx=it.startNX+gdx, ny=it.startNY+gdy;
+              var ne=document.getElementById(it.id);
+              if(ne){ne.style.left=nx+'px';ne.style.top=ny+'px';}
+              _vfNodeOverrides[it.id]={x:nx,y:ny};
+              _vfCurrentNodes.forEach(function(nd){if(nd.id===it.id){nd.x=nx;nd.y=ny;}});
+            });
+            _vfDrawEdges(_vfRebuildEdges(),_vfCurrentNodes);
+          }
           }
           return;
         }
@@ -5738,7 +7872,13 @@ _SIDEBAR_JS = """
       });
 
       document.addEventListener('mouseup', function(e){
-        if (_vfAnnotDrag)   { _vfAnnotDrag   = null; return; }
+        if (_vfAnnotDrag) {
+          if (_vfAnnotDrag.moved && _vfAnnotDrag.nodes && _vfAnnotDrag.nodes.length) {
+            _vfSelectedEdgeIdx=null; _vfDrawEdges(_vfRebuildEdges(),_vfCurrentNodes);
+          }
+          _vfAnnotDrag=null;
+          return;
+        }
         if (_vfAnnotResize) { _vfAnnotResize = null; return; }
         if (!_vfAnnotDrawing) return;
         var drawing = _vfAnnotDrawing;
@@ -5786,6 +7926,8 @@ _SIDEBAR_JS = """
     }
     var vp = document.getElementById('cg-sv-viewport');
     if (vp) vp.style.cursor = _svAnnotMode ? 'crosshair' : '';
+    var canvas = document.getElementById('cg-sv-canvas');
+    if (canvas) canvas.classList.toggle('annot-mode-active', _svAnnotMode);
   };
   function _svRenderAnnots() {
     var canvas = document.getElementById('cg-sv-canvas');
@@ -5800,6 +7942,7 @@ _SIDEBAR_JS = """
     _annotApplyColor(el, a.color);
     el.innerHTML =
       '<div class="cg-vf-annot-del" title="Delete">\xd7</div>'
+      +'<div class="cg-vf-annot-grip" title="Drag annotation (+ cards inside)"></div>'
       +(a.label ? '<div class="cg-vf-annot-label" style="font-size:'+(a.fontSize||16)+'px">'+esc(a.label)+'</div>'
                 : '<div class="cg-vf-annot-label" style="color:#4a5a6a;font-style:italic;font-size:'+(a.fontSize||16)+'px">dbl-click to label</div>')
       +'<div class="cg-vf-annot-resize" title="Resize"></div>';
@@ -5828,8 +7971,10 @@ _SIDEBAR_JS = """
     });
     el.addEventListener('mousedown', function(e){
       if (e.target.classList.contains('cg-vf-annot-del')||e.target.classList.contains('cg-vf-annot-resize')) return;
+      if (e.button !== 0) return;
       e.stopPropagation();
-      _svAnnotDrag = {idx:idx, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y};
+      _svAnnotDrag = {idx:idx, el:el, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y,
+                      moved:false, cards:_svCardsInRect(a.x, a.y, a.w||120, a.h||60)};
     });
     canvas.appendChild(el);
   }
@@ -5847,11 +7992,24 @@ _SIDEBAR_JS = """
     });
     document.addEventListener('mousemove', function(e){
       if (_svAnnotDrag) {
+        var dx=e.clientX-_svAnnotDrag.startMX, dy=e.clientY-_svAnnotDrag.startMY;
+        if (!_svAnnotDrag.moved && (Math.abs(dx)>4||Math.abs(dy)>4)) _svAnnotDrag.moved=true;
+        if (_svAnnotDrag.moved) {
+        var gdx=(e.clientX-_svAnnotDrag.startMX)/_svZoom, gdy=(e.clientY-_svAnnotDrag.startMY)/_svZoom;
         var ann = _svAnnotsLoad();
         if (ann[_svAnnotDrag.idx]) {
-          ann[_svAnnotDrag.idx].x = _svAnnotDrag.startX + (e.clientX-_svAnnotDrag.startMX)/_svZoom;
-          ann[_svAnnotDrag.idx].y = _svAnnotDrag.startY + (e.clientY-_svAnnotDrag.startMY)/_svZoom;
+          ann[_svAnnotDrag.idx].x = _svAnnotDrag.startX + gdx;
+          ann[_svAnnotDrag.idx].y = _svAnnotDrag.startY + gdy;
           _svAnnotsSave(ann); _svRenderAnnots();
+        }
+        var clist = _svAnnotDrag.cards || [];
+        if (clist.length) {
+          clist.forEach(function(it){
+            it.card.style.left = (it.origL+gdx)+'px';
+            it.card.style.top  = (it.origT+gdy)+'px';
+          });
+          _svDrawEdges();
+        }
         }
         return;
       }
@@ -5879,7 +8037,11 @@ _SIDEBAR_JS = """
       _svAnnotDrawing.el.style.cssText='left:'+x+'px;top:'+y+'px;width:'+w+'px;height:'+h+'px;pointer-events:none;position:absolute';
     });
     document.addEventListener('mouseup', function(e){
-      if (_svAnnotDrag)   { _svAnnotDrag=null; return; }
+      if (_svAnnotDrag) {
+        if (_svAnnotDrag.moved && _svAnnotDrag.cards && _svAnnotDrag.cards.length) _svDrawEdges();
+        _svAnnotDrag=null;
+        return;
+      }
       if (_svAnnotResize) { _svAnnotResize=null; return; }
       if (!_svAnnotDrawing) return;
       var drawing=_svAnnotDrawing; _svAnnotDrawing=null;
@@ -5939,8 +8101,24 @@ _SIDEBAR_JS = """
       btn.style.borderColor = _fnAnnotMode ? '#4ec980' : '#3d4451';
     }
     var layer = document.getElementById('cg-fn-annot-layer');
-    if (layer) layer.style.pointerEvents = _fnAnnotMode ? 'all' : 'none';
+    if (layer) {
+      layer.style.pointerEvents = _fnAnnotMode ? 'all' : 'none';
+      layer.classList.toggle('annot-mode-active', _fnAnnotMode);
+    }
   };
+  /* vis.js nodes whose center lies inside a graph-space rect (grip-drag bundling) */
+  function _fnNodesInRect(rx, ry, rw, rh) {
+    var out = [];
+    var net = getNet(); if (!net) return out;
+    try {
+      var pos = net.getPositions();
+      Object.keys(pos).forEach(function(id){
+        var p = pos[id];
+        if (p.x >= rx && p.x <= rx+rw && p.y >= ry && p.y <= ry+rh) out.push({id:id, startNX:p.x, startNY:p.y});
+      });
+    } catch(e) {}
+    return out;
+  }
   function _fnRenderAnnots() {
     var layer = document.getElementById('cg-fn-annot-layer');
     if (!layer) return;
@@ -5956,6 +8134,7 @@ _SIDEBAR_JS = """
     _annotApplyColor(el, a.color);
     el.innerHTML =
       '<div class="cg-vf-annot-del" title="Delete">\xd7</div>'
+      +'<div class="cg-vf-annot-grip" title="Drag annotation (+ nodes inside)"></div>'
       +(a.label ? '<div class="cg-vf-annot-label" style="font-size:'+(a.fontSize||16)+'px">'+esc(a.label)+'</div>'
                 : '<div class="cg-vf-annot-label" style="color:#4a5a6a;font-style:italic;font-size:'+(a.fontSize||16)+'px">dbl-click to label</div>')
       +'<div class="cg-vf-annot-resize" title="Resize"></div>';
@@ -5984,8 +8163,10 @@ _SIDEBAR_JS = """
     });
     el.addEventListener('mousedown', function(e){
       if (e.target.classList.contains('cg-vf-annot-del')||e.target.classList.contains('cg-vf-annot-resize')) return;
+      if (e.button !== 0) return;
       e.stopPropagation();
-      _fnAnnotDrag = {idx:idx, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y};
+      _fnAnnotDrag = {idx:idx, el:el, startMX:e.clientX, startMY:e.clientY, startX:a.x, startY:a.y,
+                      moved:false, nodes:_fnNodesInRect(a.x, a.y, a.w||120, a.h||60)};
     });
     layer.appendChild(el);
   }
@@ -6048,12 +8229,24 @@ _SIDEBAR_JS = """
     });
     document.addEventListener('mousemove', function(e){
       if (_fnAnnotDrag) {
+        var dx=e.clientX-_fnAnnotDrag.startMX, dy=e.clientY-_fnAnnotDrag.startMY;
+        if (!_fnAnnotDrag.moved && (Math.abs(dx)>4||Math.abs(dy)>4)) _fnAnnotDrag.moved=true;
+        if (_fnAnnotDrag.moved) {
         var s = (getNet() ? getNet().getScale() : 1);
+        var gdx=(e.clientX-_fnAnnotDrag.startMX)/s, gdy=(e.clientY-_fnAnnotDrag.startMY)/s;
         var ann = _fnAnnotsLoad();
         if (ann[_fnAnnotDrag.idx]) {
-          ann[_fnAnnotDrag.idx].x = _fnAnnotDrag.startX + (e.clientX - _fnAnnotDrag.startMX) / s;
-          ann[_fnAnnotDrag.idx].y = _fnAnnotDrag.startY + (e.clientY - _fnAnnotDrag.startMY) / s;
+          ann[_fnAnnotDrag.idx].x = _fnAnnotDrag.startX + gdx;
+          ann[_fnAnnotDrag.idx].y = _fnAnnotDrag.startY + gdy;
           _fnAnnotsSave(ann); _fnRenderAnnots();
+        }
+        var nlist = _fnAnnotDrag.nodes || [];
+        if (nlist.length) {
+          var net0 = getNet();
+          if (net0) nlist.forEach(function(it){
+            try { net0.moveNode(it.id, it.startNX+gdx, it.startNY+gdy); } catch(e){}
+          });
+        }
         }
         return;
       }
@@ -6084,7 +8277,7 @@ _SIDEBAR_JS = """
       _fnAnnotDrawing.el.style.cssText = 'left:'+px+'px;top:'+py+'px;width:'+pw+'px;height:'+ph+'px;pointer-events:none;';
     });
     document.addEventListener('mouseup', function(e){
-      if (_fnAnnotDrag)   { _fnAnnotDrag   = null; return; }
+      if (_fnAnnotDrag) { _fnAnnotDrag = null; return; }
       if (_fnAnnotResize) { _fnAnnotResize = null; return; }
       if (!_fnAnnotDrawing) return;
       var drawing = _fnAnnotDrawing; _fnAnnotDrawing = null;
@@ -6522,6 +8715,87 @@ _SIDEBAR_JS = """
     });
   })();
 
+  /* ── Nodebook: capture/restore adapters for SIDEBAR-owned modes ──
+     Each adapter serialises the live state of one mode and restores it.
+     Registered on window.CG_NB_ADAPTERS; the Nodebook engine (separate block)
+     switches to the mode first, then calls restore(state). Rule 12: every
+     viewable mode is capturable. All guarded so capture never throws into the
+     user's normal interaction. */
+  window.CG_NB_ADAPTERS = window.CG_NB_ADAPTERS || {};
+
+  window.CG_NB_ADAPTERS['fn'] = {
+    label: 'Function Nodes',
+    title: function(st){ var s = st && st.search; return s ? ('Function Nodes \u00b7 ' + s) : 'Function Nodes'; },
+    capture: function(){
+      var st = { search: (searchInput ? searchInput.value : '') };
+      try {
+        var net = getNet();
+        if (net) { st.positions = net.getPositions(); st.scale = net.getScale(); st.center = net.getViewPosition(); }
+      } catch(e){}
+      return st;
+    },
+    restore: function(st){
+      if (!st) return;
+      try {
+        var net = getNet();
+        if (net && st.positions) {
+          Object.keys(st.positions).forEach(function(id){
+            try { net.moveNode(id, st.positions[id].x, st.positions[id].y); } catch(e){}
+          });
+        }
+        if (net && st.center && st.scale) net.moveTo({ position: st.center, scale: st.scale, animation:false });
+      } catch(e){}
+      if (searchInput && typeof st.search === 'string') searchInput.value = st.search;
+    }
+  };
+
+  window.CG_NB_ADAPTERS['script'] = {
+    label: 'Script Nodes',
+    title: function(st){ var s = st && st.search; return s ? ('Script \u00b7 ' + s) : 'Script Nodes'; },
+    capture: function(){
+      var st = { search:(searchInput?searchInput.value:''),
+                 pan:{x:_svPanX, y:_svPanY, z:_svZoom}, cards:{}, collapsed:[] };
+      document.querySelectorAll('#cg-sv-canvas .cg-file-card').forEach(function(c){
+        st.cards[c.dataset.fp] = {x:parseFloat(c.style.left)||0, y:parseFloat(c.style.top)||0};
+        if (c.classList.contains('sv-collapsed')) st.collapsed.push(c.dataset.fp);
+      });
+      return st;
+    },
+    restore: function(st){
+      if (!st) return;
+      try { if (st.cards) localStorage.setItem(SV_LAYOUT_KEY, JSON.stringify(st.cards)); } catch(e){}
+      try {
+        if (st.collapsed) {
+          var set = {}; st.collapsed.forEach(function(fp){ set[fp]=1; });
+          localStorage.setItem(_SV_COLLAPSE_KEY, JSON.stringify(set));
+        }
+      } catch(e){}
+      _svBuilt = false; _buildScriptView();
+      if (st.pan){ _svPanX=st.pan.x; _svPanY=st.pan.y; _svZoom=st.pan.z; _svApplyTransform(); }
+      if (searchInput && typeof st.search==='string') searchInput.value = st.search;
+    }
+  };
+
+  window.CG_NB_ADAPTERS['varflow'] = {
+    label: 'Variable Flow',
+    title: function(st){ var v = st && st.varName; return v ? ('VarFlow \u00b7 ' + v) : 'Variable Flow'; },
+    capture: function(){
+      return {
+        varName: _vfCurrentVar || '',
+        scope: _vfCurrentScope || null,
+        overrides: JSON.parse(JSON.stringify(_vfNodeOverrides || {})),
+        pan: {x:_vfPanX, y:_vfPanY, z:_vfZoom}
+      };
+    },
+    restore: function(st){
+      if (!st || !st.varName) return;
+      var lk = st.scope ? (st.varName + _VF_SCOPE_SEP + st.scope) : st.varName;
+      try { if (st.overrides) localStorage.setItem(VF_LAYOUT_PFX + lk, JSON.stringify(st.overrides)); } catch(e){}
+      _vfSelectVar(lk);
+      if (st.pan){ _vfPanX=st.pan.x; _vfPanY=st.pan.y; _vfZoom=st.pan.z; _vfApplyTransform(); }
+    }
+  };
+
   setTimeout(wire, 300);
 })();
 </script>
@@ -6546,11 +8820,19 @@ class HtmlRenderer(BaseRenderer):
             raise ImportError("pyvis is not installed. Run: pip install pyvis")
 
         out = output_path.with_suffix(".html")
-        layout = _compute_layout(graph)
+        root_ranks = _compute_root_ranks(graph)
+        node_sizes = {}
+        for nid, fn in graph.functions.items():
+            lbl = _build_node_label(fn, self.config)
+            rk = root_ranks.get(nid)
+            if rk:
+                lbl = lbl + ROOT_SUFFIX[rk]
+            node_sizes[nid] = _sl_estimate_size(lbl)
+        layout = _compute_layout(graph, node_sizes=node_sizes)
         layout_key = _layout_key(graph)
-        net, all_positions = self._build_network(graph, layout)
+        net, all_positions = self._build_network(graph, layout, root_ranks)
         raw_html = net.generate_html(notebook=False)
-        full_html = self._inject_sidebar(raw_html, graph, all_positions, layout_key)
+        full_html = self._inject_sidebar(raw_html, graph, all_positions, layout_key, root_ranks)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(full_html, encoding="utf-8")
         return out
@@ -6560,9 +8842,13 @@ class HtmlRenderer(BaseRenderer):
     # Node counts above this threshold disable Function Nodes mode entirely
     # (vis.js becomes unusable). The UI auto-switches to Script Nodes view.
     _HUGE_GRAPH_THRESHOLD = 8000
+    # PERF-8: node counts at/above this threshold enable viewport virtualisation
+    # (CSS content-visibility) for the custom-DOM modes when virtualize_dom="auto".
+    _VIRT_DOM_THRESHOLD = 400
 
     def _build_network(
-        self, graph: CallGraph, layout: dict[str, tuple[float, float]]
+        self, graph: CallGraph, layout: dict[str, tuple[float, float]],
+        root_ranks: dict[str, int],
     ) -> tuple["Network", dict[str, dict]]:
         cfg = self.config
         n_nodes = len(graph.functions)
@@ -6624,7 +8910,14 @@ class HtmlRenderer(BaseRenderer):
             color = EXTERNAL_COLOR if fn.is_external else LANG_COLORS.get(fn.language, LANG_COLORS[Language.PYTHON])
             label = _build_node_label(fn, cfg)
             is_entry = fn.name in entry_ids or fn.qualified_name in entry_ids
-            border_color = ENTRY_BORDER if is_entry else color["border"]
+            rank = root_ranks.get(node_id)
+            if rank:
+                border_color = ROOT_BORDERS[rank]
+                label = label + ROOT_SUFFIX[rank]
+            elif is_entry:
+                border_color = ENTRY_BORDER
+            else:
+                border_color = color["border"]
 
             # Position already populated by the pre-loop above.
             pos = all_positions[node_id]
@@ -6633,7 +8926,7 @@ class HtmlRenderer(BaseRenderer):
             net.add_node(
                 node_id, label=label, title="",
                 color={**color, "border": border_color},
-                borderWidth=(3 if is_entry else 1),
+                borderWidth=(3 if (is_entry or rank) else 1),
                 shape="box",
                 font={"size": 11, "face": "monospace", "color": "#ffffff"},
                 size=20, x=int(x), y=int(y), physics=False,
@@ -6684,6 +8977,7 @@ class HtmlRenderer(BaseRenderer):
         graph: CallGraph,
         all_positions: dict[str, dict],
         layout_key: str,
+        root_ranks: dict[str, int],
     ) -> str:
         cfg = self.config
         stats = graph.stats()
@@ -6704,9 +8998,11 @@ class HtmlRenderer(BaseRenderer):
                     "parent":         fn.parent,
                     "is_external":    fn.is_external,
                     "is_method":      fn.is_method,
+                    "is_virtual":     fn.is_virtual,
                     "func_type":      fn.func_type,
                     "docstring":      fn.docstring,
                     "tracked_vars":   fn.tracked_vars,
+                    "root_rank":      root_ranks.get(node_id),
                     "variables":      [
                         {
                             "name": var.name,
@@ -6781,23 +9077,49 @@ class HtmlRenderer(BaseRenderer):
         large_graph_flag = n_nodes >= HtmlRenderer._LARGE_GRAPH_THRESHOLD
         huge_graph_flag  = n_nodes >= HtmlRenderer._HUGE_GRAPH_THRESHOLD
 
+        # PERF-8: viewport virtualisation policy for the custom-DOM modes.
+        # output.virtualize_dom: True=always, False=never, "auto"=by node count.
+        _vd = getattr(self.config.output, "virtualize_dom", "auto")
+        if _vd is True:
+            virt_dom_flag = True
+        elif _vd is False:
+            virt_dom_flag = False
+        else:
+            virt_dom_flag = n_nodes >= HtmlRenderer._VIRT_DOM_THRESHOLD
+
         # Compact JSON: no indentation, no spaces. At 15K nodes this saves megabytes
         # off the embedded payload without changing semantics.
         _compact = lambda obj: json.dumps(obj, separators=(',', ':'))
 
+        # PERF-5: optionally compress each big payload to `__cgJ("<base64>")`.
+        # Policy from output.compress_payload: True=always, False=never, "auto"=by size.
+        _cp = getattr(self.config.output, "compress_payload", "auto")
+        _used_compression = [False]
+
+        def _emit(obj):
+            s = _compact(obj)
+            if _cp is False:
+                return s
+            if _cp is True or (_cp != False and len(s) >= _COMPRESS_THRESHOLD):
+                _used_compression[0] = True
+                return "__cgJ(" + json.dumps(_deflate_b64(s)) + ")"
+            return s
+
         sidebar_js = (
             _SIDEBAR_JS
-            .replace("CG_NODE_DATA",     _compact(node_data))
-            .replace("CG_EDGE_DATA",     _compact(edge_data))
-            .replace("CG_INITIAL_POS",   _compact(all_positions))
+            .replace("CG_NODE_DATA",     _emit(node_data))
+            .replace("CG_EDGE_DATA",     _emit(edge_data))
+            .replace("CG_INITIAL_POS",   _emit(all_positions))
             .replace("CG_LAYOUT_KEY",    json.dumps(layout_key))
-            .replace("CG_ALL_NODE_IDS",  _compact(all_node_ids))
-            .replace("CG_VAR_PARENT",    _compact(var_parent_map))
-            .replace("CG_VAR_FLOW_DATA", _compact(var_flow_data))
+            .replace("CG_ALL_NODE_IDS",  _emit(all_node_ids))
+            .replace("CG_VAR_PARENT",    _emit(var_parent_map))
+            .replace("CG_VAR_FLOW_DATA", _emit(var_flow_data))
             .replace("CG_GRAPH_ID",      json.dumps(graph_id))
             .replace("CG_LARGE_GRAPH",   json.dumps(large_graph_flag))
             .replace("CG_HUGE_GRAPH",    json.dumps(huge_graph_flag))
             .replace("CG_HUGE_THRESHOLD", json.dumps(HtmlRenderer._HUGE_GRAPH_THRESHOLD))
+            .replace("CG_VIRT_DOM",      json.dumps(virt_dom_flag))
+            .replace("CG_ROOT_RANKS",    _emit(root_ranks))
         )
 
         detail_div = '<div id="cg-detail"></div>'
@@ -6819,12 +9141,33 @@ class HtmlRenderer(BaseRenderer):
             '<button id="cg-vf-search-clear" title="Clear">\xd7</button>'
             '<div id="cg-vf-dropdown"></div>'
             '</div>'
+            '<button id="cg-vf-scope-btn" title="Split variables by scope (don\'t merge unrelated same-named locals)" onclick="_vfToggleScopeSplit()">'
+            '⚎ Split scope'
+            '</button>'
+            '<button id="cg-vf-backward-btn" title="Flow direction: Forward = downstream def-use (where does this value go?); Backward = upstream trace (where did this value come from?)" onclick="_vfToggleBackwardFlow()">'
+            '\u2b9e Forward'
+            '</button>'
+            '<button id="cg-vf-hldir-btn" title="Click-highlight direction: Downstream = colour nodes this block flows into (VF-2); Upstream = colour nodes that feed into this block (VF-6)" onclick="_vfToggleHighlightDirection()">'
+            '\u2b9f Downstream'
+            '</button>'
+            '<label id="cg-vf-trace-cb-lbl" title="Click a block to colour its flow paths. Uncheck to drag blocks without re-tracing.">'
+            '<input type="checkbox" id="cg-vf-trace-cb" onchange="_vfToggleTraceEnabled(this.checked)"> trace'
+            '</label>'
             '<button id="cg-vf-dead-btn" title="Show all unused/dead variables" onclick="_vfToggleDeadMode()">'
             '⛔ Dead Vars'
             '</button>'
             '<button id="cg-vf-annot-btn" title="Draw annotation rectangle (click then drag on canvas)" onclick="_vfToggleAnnotMode()">'
             '□ Annotate'
             '</button>'
+            '</div>'
+            '<div id="cg-vf-family-row">'
+            '<span class="cg-vf-fam-label">Show:</span>'
+            '<button class="cg-vf-fam-btn" data-fam="variable" onclick="_vfToggleFamilyFilter(\'variable\')" title="Toggle visibility of normal assign/read variable blocks">🔵 Variable</button>'
+            '<button class="cg-vf-fam-btn" data-fam="member" onclick="_vfToggleFamilyFilter(\'member\')" title="Toggle visibility of member-access (struct/class field) blocks">🟣 Member</button>'
+            '<span class="cg-vf-fam-sep"></span>'
+            '<span class="cg-vf-fam-label">All flows:</span>'
+            '<button class="cg-vf-fam-show-btn" data-fam="lugasi" onclick="_vfShowFamily(\'lugasi\')" title="Show every custom-input source block and its downstream flow">🟠 <span class="cg-vf-fam-show-lbl">…</span></button>'
+            '<button class="cg-vf-fam-show-btn" data-fam="connect" onclick="_vfShowFamily(\'connect\')" title="Show every .connect input block and its downstream flow">🔗 <span class="cg-vf-fam-show-lbl">.connect</span></button>'
             '</div>'
             '</div>'
             '<div id="cg-vf-graph-area">'
@@ -6888,18 +9231,21 @@ class HtmlRenderer(BaseRenderer):
         #    architecture, confidence filter. All additive — existing IDs untouched.
         extras_payload = self._build_extras_payload(graph)
 
-        html = raw_html.replace("</head>", _SIDEBAR_CSS + "\n" + _CGX_EXTRAS_CSS + "\n</head>", 1)
+        html = raw_html.replace("</head>", _SIDEBAR_CSS + "\n" + _CGX_EXTRAS_CSS + "\n" + _NODEBOOK_CSS + "\n</head>", 1)
         html = html.replace(
             "<body>",
             "<body>\n" + sidebar_html + "\n"
             + '<div id="cg-script-view"></div>' + "\n"
             + varflow_div + "\n"
             + _CGX_EXTRAS_HTML + "\n"
+            + _NODEBOOK_HTML + "\n"
             + detail_div + "\n" + modal_div,
             1,
         )
-        extras_js = _CGX_EXTRAS_JS.replace("CGX_EXTRAS_DATA", json.dumps(extras_payload, separators=(",", ":")))
-        html = html.replace("</body>", sidebar_js + "\n" + extras_js + "\n</body>", 1)
+        extras_js = _CGX_EXTRAS_JS.replace("CGX_EXTRAS_DATA", _emit(extras_payload))
+        # PERF-5: only embed the ~6 KB inflate bootstrap when something was compressed.
+        decomp_js = _DECOMP_JS if _used_compression[0] else ""
+        html = html.replace("</body>", decomp_js + sidebar_js + "\n" + extras_js + "\n" + _NODEBOOK_JS + "\n</body>", 1)
         return html
 
     # ------------------------------------------------------------------ #
@@ -6950,6 +9296,8 @@ class HtmlRenderer(BaseRenderer):
         include_dict = None
         if graph.include_graph is not None:
             ig = graph.include_graph
+            # Compute root ranks for include graph (fewest includers + largest subtree)
+            inc_root_ranks = _compute_include_root_ranks(ig)
             include_dict = {
                 "files": {
                     f: [
@@ -6960,6 +9308,7 @@ class HtmlRenderer(BaseRenderer):
                             "resolved": e.resolved,
                             "raw": e.raw_target,
                             "line": e.line,
+                            "guard": e.guard,
                         }
                         for e in edges
                     ]
@@ -6968,6 +9317,20 @@ class HtmlRenderer(BaseRenderer):
                 "unresolved_count": len(ig.unresolved),
                 "cycles": ig.cycles[:25],
                 "most_included": ig.most_included,
+                "root_ranks": inc_root_ranks,
+                # INC-1: includes dropped by a definitely-false preprocessor guard.
+                "excluded": [
+                    {
+                        "from": e.from_file,
+                        "to": e.to_file,
+                        "raw": e.raw_target,
+                        "line": e.line,
+                        "guard": e.guard,
+                        "is_system": e.is_system,
+                    }
+                    for e in ig.excluded[:200]
+                ],
+                "excluded_count": len(ig.excluded),
             }
 
         # Per-slot payloads. Each slot may be at a different render level. The
@@ -6989,6 +9352,7 @@ class HtmlRenderer(BaseRenderer):
                         "line_start": fn.line_start,
                         "line_end": fn.line_end,
                         "is_external": fn.is_external,
+                        "is_virtual": fn.is_virtual,
                         "func_type": fn.func_type,
                         "tracked_vars": fn.tracked_vars,
                     },
@@ -7117,6 +9481,23 @@ _CGX_EXTRAS_CSS = r"""
   padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
 }
 #cgx-inc-close:hover { background: #2d3a50; color: #fff; }
+#cg-iv-showall {
+  background: #2b2140; color: #d9c7ff; border: 1px solid #5a4790;
+  padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+#cg-iv-showall:hover { background: #3a2d57; color: #fff; }
+.cg-iv-guard {
+  display: inline-block; font-size: 9px; color: #c89bff;
+  background: rgba(120,80,200,0.16); border: 1px solid rgba(120,80,200,0.4);
+  border-radius: 3px; padding: 0 4px; margin-left: 5px; vertical-align: middle;
+}
+.cg-iv-panel-btn {
+  display: block; width: 100%; box-sizing: border-box; margin: 4px 0 0;
+  background: #243a52; color: #cfe2f7; border: 1px solid #35597e;
+  padding: 5px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; text-align: left;
+}
+.cg-iv-panel-btn:hover { background: #2f4d6c; color: #fff; }
+.cg-iv-excl-item { font-size: 11px; padding: 2px 0; color: #c8b8e0; }
 
 /* legend bar */
 #cg-iv-legend {
@@ -7471,6 +9852,7 @@ _CGX_EXTRAS_JS = r"""
 (function(){
   var CGX = CGX_EXTRAS_DATA;
   if (!CGX) return;
+  try { window.CGX = CGX; } catch(e) {}  /* expose for Investigator / debugging */
   var NODE_DATA = window.CGX_NODE_DATA || [];
   var EDGE_DATA = window.CGX_EDGE_DATA || [];
 
@@ -7520,6 +9902,22 @@ _CGX_EXTRAS_JS = r"""
   if (CGX.include_graph_enabled && btnVf && btnVf.parentElement) {
     btnInc = _h('button', {'class':'cg-btn','id':'cgx-btn-mode-inc'}, 'Include Graph');
     btnVf.parentElement.appendChild(btnInc);
+  }
+
+  /* Nodebook controls stay inside the View Mode section but on their own second
+     row (the mode-button row was too tight). Available in every mode (Rule 12):
+     a ➕ Capture button snapshots the current view and a 📓 Nodebook tab opens
+     the saved-pages gallery. */
+  var _modeRow = (btnVf && btnVf.parentElement) || (btnFn && btnFn.parentElement);
+  var btnCapture = null, btnNodebook = null;
+  if (_modeRow) {
+    var _nbRow = _h('div', {'class':'cg-nb-btn-row'});
+    btnCapture  = _h('button', {'class':'cg-btn','id':'cgx-btn-nb-capture','title':'Capture current view to Nodebook (N)'}, '➕ Capture');
+    btnNodebook = _h('button', {'class':'cg-btn','id':'cgx-btn-mode-nodebook','title':'Open Nodebook (B)'}, '📓 Nodebook');
+    _nbRow.appendChild(btnCapture);
+    _nbRow.appendChild(btnNodebook);
+    if (_modeRow.parentElement) _modeRow.parentElement.insertBefore(_nbRow, _modeRow.nextSibling);
+    else _modeRow.appendChild(_nbRow);
   }
 
   /* Map render level -> internal mode id used by setViewMode.
@@ -7762,7 +10160,8 @@ _CGX_EXTRAS_JS = r"""
     '<div class="cgx-row">'+
       '<span>Top-N per card:</span>'+
       '<input type="number" id="cgx-mv-topn" value="25" min="5" max="500" style="width:60px;background:#1e2229;color:#fff;border:1px solid #2d3139;border-radius:3px;padding:2px 4px">'+
-    '</div>'
+    '</div>'+
+    '<div class="cgx-row" id="cgx-mv-trace-row" style="margin-top:4px"></div>'
   );
   if (sb) sb.appendChild(mvSec);
 
@@ -7773,7 +10172,13 @@ _CGX_EXTRAS_JS = r"""
 
     /* ── helpers ──────────────────────────────────────────────────── */
     var _HDR_EXTS = /\.(h|hpp|hxx|hh|inl|tpp)$/i;
+    var _M_EXT = /\.m$/i;
     function _isHeader(p) { return _HDR_EXTS.test((p||'').replace(/\\/g,'/').replace(/\?.*$/,'')); }
+    /* A graph node is any C/C++ header OR a MATLAB .m module file (gap G5). */
+    function _isGraphNode(p) {
+      var s = (p||'').replace(/\\/g,'/').replace(/\?.*$/,'');
+      return _HDR_EXTS.test(s) || _M_EXT.test(s);
+    }
     function _base(p) { return (p||'').replace(/\\/g,'/').split('/').pop(); }
     function _dir(p)  { var s=(p||'').replace(/\\/g,'/'); var i=s.lastIndexOf('/'); return i>0?s.slice(0,i):'(root)'; }
 
@@ -7814,10 +10219,14 @@ _CGX_EXTRAS_JS = r"""
     var _ivMarquee = null, _ivMultiSel = {};
     var NODE_W = 190, NODE_H = 54;
     var _ivVisNodes = [], _ivVisEdges = [];
+    var _ivHeat = false;          /* INC-2: colour nodes by include depth */
+    var _ivDepth = {}, _ivMaxDepth = 0; /* INC-2: per-node max include depth */
+    var _ivExcluded = ig.excluded || [];      /* INC-1: guarded-out includes */
+    var _ivExclCount = ig.excluded_count || 0;
 
     /* ── build node/edge sets (rebuilt when system-includes toggle changes) ── */
-    var _projHdrs = {}; // path -> edges[] (always populated, all project headers)
-    Object.keys(ig.files).forEach(function(fp){ if(_isHeader(fp)) _projHdrs[fp]=ig.files[fp]; });
+    var _projHdrs = {}; // path -> edges[] (project headers AND .m module files, gap G5)
+    Object.keys(ig.files).forEach(function(fp){ if(_isGraphNode(fp)) _projHdrs[fp]=ig.files[fp]; });
 
     /* Mutable arrays rebuilt by _ivBuildGraph() */
     var _ivNodes   = [];
@@ -7895,6 +10304,43 @@ _CGX_EXTRAS_JS = r"""
     /* initial build */
     _ivBuildGraph();
 
+    /* ── INC-2: longest include-depth per node ─────────────────────────
+     * depth(node) = length of the longest chain of #includes leading INTO the
+     * node (0 = a root that nothing includes). Deeply-nested headers — the ones
+     * that inflate compile times — get the highest values. Cycle-safe. */
+    function _ivComputeDepth() {
+      _ivDepth = {}; _ivMaxDepth = 0;
+      var radj = {}; /* node -> parents (headers that include it) */
+      _ivNodes.forEach(function(n){ radj[n.id] = []; });
+      _ivEdges.forEach(function(e){ if (radj[e.to]) radj[e.to].push(e.from); });
+      var state = {}; /* 0=unvisited 1=on-stack 2=done */
+      function dfs(id){
+        if (state[id] === 2) return _ivDepth[id];
+        if (state[id] === 1) return 0; /* cycle guard */
+        state[id] = 1;
+        var best = 0;
+        (radj[id] || []).forEach(function(p){
+          var d = dfs(p) + 1;
+          if (d > best) best = d;
+        });
+        _ivDepth[id] = best; state[id] = 2;
+        if (best > _ivMaxDepth) _ivMaxDepth = best;
+        return best;
+      }
+      _ivNodes.forEach(function(n){ dfs(n.id); });
+    }
+    _ivComputeDepth();
+
+    function _ivHeatColor(d) {
+      var t = _ivMaxDepth > 0 ? Math.max(0, Math.min(1, d / _ivMaxDepth)) : 0;
+      /* hue 200 (blue, shallow) -> 0 (red, deep) */
+      var hue = Math.round(200 * (1 - t));
+      var light = 22 + Math.round(t * 8);
+      return { bg: 'hsl('+hue+',55%,'+light+'%)',
+               border: 'hsl('+hue+',60%,'+(light+22)+'%)',
+               text: 'hsl('+hue+',45%,88%)' };
+    }
+
     /* ── skeleton HTML ────────────────────────────────────────────── */
     incView.innerHTML =
       '<div id="cg-iv-toolbar">' +
@@ -7902,18 +10348,29 @@ _CGX_EXTRAS_JS = r"""
         '<span class="cg-iv-stat" id="cg-iv-s-files"><b>'+Object.keys(_projHdrs).length+'</b> headers</span>' +
         '<span class="cg-iv-stat" id="cg-iv-s-miss"><b>'+_ivMissingCount+'</b> missing</span>' +
         '<span class="cg-iv-stat" id="cg-iv-s-cyc"><b>'+(ig.cycles||[]).length+'</b> cycles</span>' +
+        (_ivExclCount ? '<span class="cg-iv-stat" id="cg-iv-s-excl" title="Includes dropped by a preprocessor guard (INC-1)" style="cursor:pointer;color:#c89bff"><b>'+_ivExclCount+'</b> guarded-out</span>' : '') +
         '<div class="cg-iv-filters">' +
+          '<label class="cg-iv-filter-lbl" title="INC-2: colour headers by their maximum include depth"><input type="checkbox" id="cg-iv-heat"> 🌡 depth heat-map</label>' +
+          '<button id="cg-iv-showall" title="INC-3: clear focus and show the whole graph" style="display:none">↺ Show all</button>' +
           '<input id="cg-iv-search" type="text" placeholder="search headers…" spellcheck="false">' +
+          '<span id="cg-iv-trace-mount" style="display:inline-flex;align-items:center"></span>' +
         '</div>' +
         '<button id="cgx-inc-close" title="Close">✕ Close</button>' +
       '</div>' +
       '<div id="cg-iv-legend">' +
+        '<span id="cg-iv-legend-status">' +
         '<span class="cg-iv-leg"><span class="cg-iv-leg-dot" style="background:#1f3028;border:1px solid #27ae60"></span>resolved</span>' +
         '<span class="cg-iv-leg"><span class="cg-iv-leg-dot" style="background:#2e1e0a;border:1px dashed #e67e22"></span>missing</span>' +
         '<span class="cg-iv-leg"><span class="cg-iv-leg-dot" style="background:#2a1010;border:1px solid #e74c3c"></span>cycle</span>' +
         '<span class="cg-iv-leg"><span class="cg-iv-leg-dot" style="background:#252012;border:1px solid #7a6a10"></span>mixed</span>' +
         '<span class="cg-iv-leg"><span class="cg-iv-leg-dot" style="background:#1a1e2a;border:1px dotted #3a4460"></span>system</span>' +
-        '<span style="margin-left:auto;font-size:10px;color:#5a7090">scroll to zoom · middle-drag to pan · drag background to multi-select · drag nodes to move</span>' +
+        '</span>' +
+        '<span id="cg-iv-legend-heat" style="display:none;align-items:center;gap:6px">' +
+          'include depth&nbsp;<span style="font-size:10px">shallow</span>' +
+          '<span style="display:inline-block;width:120px;height:10px;border-radius:3px;background:linear-gradient(90deg,hsl(200,60%,24%),hsl(120,60%,26%),hsl(50,65%,30%),hsl(0,65%,30%))"></span>' +
+          '<span style="font-size:10px">deep</span>' +
+        '</span>' +
+        '<span style="margin-left:auto;font-size:10px;color:#5a7090">scroll to zoom · middle-drag to pan · drag background to multi-select · double-click a header to focus its include closure</span>' +
       '</div>' +
       '<div id="cg-iv-body">' +
         '<div id="cg-iv-canvas"><div id="cg-iv-canvas-inner">' +
@@ -8155,6 +10612,8 @@ _CGX_EXTRAS_JS = r"""
         path.setAttribute('stroke-dasharray', e.isMissing?'5,3':'');
         path.setAttribute('marker-end','url(#'+marker+')');
         path.setAttribute('opacity', e.isSys?'0.9':'0.8');
+        path.setAttribute('data-from', e.from);
+        path.setAttribute('data-to', e.to);
         svg.appendChild(path);
       });
       var inner = document.getElementById('cg-iv-canvas-inner');
@@ -8199,13 +10658,34 @@ _CGX_EXTRAS_JS = r"""
           + (_ivMultiSel[n.id] ? ' iv-multi-selected' : '');
         el.style.left = p.x+'px'; el.style.top = p.y+'px';
         el.setAttribute('data-nid', n.id);
-        el.title = n.path;
+        var _d = _ivDepth[n.id] || 0;
+        el.title = n.path + '  ·  include depth ' + _d;
         var badge = n.inDeg ? '<span class="cg-iv-node-badge">×'+n.inDeg+'</span>' : '';
+        if (_ivHeat) {
+          var hc = _ivHeatColor(_d);
+          el.style.background = hc.bg;
+          el.style.borderColor = hc.border;
+          el.style.color = hc.text;
+          badge = '<span class="cg-iv-node-badge">d'+_d+(n.inDeg?' ×'+n.inDeg:'')+'</span>';
+        }
         el.innerHTML = '<div class="cg-iv-node-label">'+esc(n.label)+'</div>' +
                        '<div class="cg-iv-node-sub">'+esc(_dir(n.path))+'</div>' + badge;
+        /* Root badge for include graph */
+        var ivRootRank = ig.root_ranks && ig.root_ranks[n.id];
+        if (ivRootRank === 1) el.innerHTML += '<span class="cg-root-badge rank-1" style="position:absolute;bottom:4px;left:4px;font-size:9px">&#x1F451; Root</span>';
+        else if (ivRootRank === 2) el.innerHTML += '<span class="cg-root-badge rank-2" style="position:absolute;bottom:4px;left:4px;font-size:9px">&#x2605; Root #2</span>';
+        else if (ivRootRank === 3) el.innerHTML += '<span class="cg-root-badge rank-3" style="position:absolute;bottom:4px;left:4px;font-size:9px">&#x2605; Root #3</span>';
         inner.appendChild(el);
         _ivNodeEls[n.id] = el;
       });
+
+      /* PERF-8: virtualise include-graph node tiles (arrows read each tile's own
+         offsetWidth/Height, preserved by the pinned intrinsic-size). */
+      if (window._cgVirtualize) window._cgVirtualize(inner, '.cg-iv-node');
+
+      /* INC-3: reflect focus state on the "Show all" button */
+      var _sa = document.getElementById('cg-iv-showall');
+      if (_sa) _sa.style.display = (_ivFocusIds !== null) ? '' : 'none';
 
       /* draw arrows */
       setTimeout(_ivDrawArrows, 0);
@@ -8250,6 +10730,15 @@ _CGX_EXTRAS_JS = r"""
       var cycles = _cyclesFor(nid);
       var html = '';
 
+      /* INC-3: prune-to-closure actions (skip for missing headers) */
+      if (!node.isMissing) {
+        html += '<div class="cg-iv-section">' +
+          '<button class="cg-iv-panel-btn" data-prune="down">⌖ Show include closure (everything this pulls in)</button>' +
+          '<button class="cg-iv-panel-btn" data-prune="up">⤢ Show who includes this (closure)</button>' +
+          (_ivFocusIds !== null ? '<button class="cg-iv-panel-btn" data-prune="clear">↺ Show whole graph</button>' : '') +
+        '</div>';
+      }
+
       /* outgoing includes */
       var visEdges = edges.filter(function(e){ return _ivShowSys||!e.is_system; });
       html += '<div class="cg-iv-section"><div class="cg-iv-section-title">Includes ('+visEdges.length+')</div>';
@@ -8267,9 +10756,10 @@ _CGX_EXTRAS_JS = r"""
           var cls = e.is_system?'cg-iv-edge-sys':(e.resolved?'cg-iv-edge-ok':'cg-iv-edge-unr');
           var nav = (!e.is_system&&e.resolved) ? ' data-goto="'+esc(e.to)+'"' : '';
           var navMiss = (!e.resolved&&!e.is_system) ? ' data-unr="'+esc(e.raw)+'"' : '';
+          var guard = e.guard ? ' <span class="cg-iv-guard" title="Conditional include — only active under this preprocessor guard">'+esc(e.guard)+'</span>' : '';
           html += '<div class="cg-iv-edge-item"><span class="'+cls+'"'+nav+navMiss+'>'+(e.is_system?'&lt;':'&quot;')+esc(e.raw)+(e.is_system?'&gt;':'&quot;')+
             (!e.resolved&&!e.is_system?' <i style="font-size:9px">(not found)</i>':'')+
-            '</span>'+(e.line?'<span class="cg-iv-line">L'+e.line+'</span>':'')+'</div>';
+            '</span>'+guard+(e.line?'<span class="cg-iv-line">L'+e.line+'</span>':'')+'</div>';
         });
       }
       html += '</div>';
@@ -8291,6 +10781,14 @@ _CGX_EXTRAS_JS = r"""
       }
 
       pbody.innerHTML = html;
+      /* INC-3: wire prune-to-closure buttons */
+      Array.prototype.forEach.call(pbody.querySelectorAll('[data-prune]'), function(el){
+        el.addEventListener('click', function(){
+          var mode = el.getAttribute('data-prune');
+          if (mode === 'clear') { if (window.cgxIncClearFocus) window.cgxIncClearFocus(); return; }
+          if (window.cgxIncIsolate) window.cgxIncIsolate(nid, 0, mode === 'up' ? 'callers' : 'callees');
+        });
+      });
       /* wire panel clicks */
       Array.prototype.forEach.call(pbody.querySelectorAll('[data-goto]'), function(el){
         el.addEventListener('click', function(){ _ivOpenPanel(el.getAttribute('data-goto')); _ivScrollTo(el.getAttribute('data-goto')); });
@@ -8302,6 +10800,31 @@ _CGX_EXTRAS_JS = r"""
           _ivScrollTo('miss:'+raw);
         });
       });
+    }
+
+    /* INC-1: list the includes that were dropped by a definitely-false guard. */
+    function _ivShowExcluded() {
+      var panel = document.getElementById('cg-iv-panel');
+      var pbody = document.getElementById('cg-iv-panel-body');
+      if (!panel || !pbody) return;
+      document.getElementById('cg-iv-ph-name').textContent = 'Guarded-out includes';
+      document.getElementById('cg-iv-ph-path').textContent =
+        _ivExclCount + ' include(s) dropped by preprocessor guards (INC-1)';
+      panel.classList.add('open');
+      var html = '<div class="cg-iv-section"><div class="cg-iv-empty-note">' +
+        'These #include lines sit inside a branch the build defines prove is not ' +
+        'taken (e.g. an #if 0 block, or the inactive side of an #ifdef whose macro ' +
+        'is known-defined), so they are excluded from the graph.</div>';
+      (_ivExcluded || []).forEach(function(e){
+        var src = (e.from || '').replace(/\\/g,'/').split('/').pop();
+        html += '<div class="cg-iv-excl-item">' +
+          '<b>'+esc(e.is_system?'<'+e.raw+'>':'"'+e.raw+'"')+'</b>' +
+          ' <span class="cg-iv-guard">'+esc(e.guard||'')+'</span>' +
+          '<div style="color:#5a7090;font-size:10px">in '+esc(src)+(e.line?' · L'+e.line:'')+'</div>' +
+        '</div>';
+      });
+      html += '</div>';
+      pbody.innerHTML = html;
     }
 
     function _ivScrollTo(nid){
@@ -8321,6 +10844,35 @@ _CGX_EXTRAS_JS = r"""
     var srch = document.getElementById('cg-iv-search');
     if(srch) srch.addEventListener('input', function(){ _ivSearch=srch.value; _ivRender(); });
 
+    /* INC-2: depth heat-map toggle */
+    var heatCb = document.getElementById('cg-iv-heat');
+    if (heatCb) {
+      try { if (localStorage.getItem('cgxIncHeat') === '1') { heatCb.checked = true; _ivHeat = true; } } catch(e){}
+      var _statusLeg = document.getElementById('cg-iv-legend-status');
+      var _heatLeg = document.getElementById('cg-iv-legend-heat');
+      function _syncHeatLegend(){
+        if (_statusLeg) _statusLeg.style.display = _ivHeat ? 'none' : '';
+        if (_heatLeg) _heatLeg.style.display = _ivHeat ? 'inline-flex' : 'none';
+      }
+      _syncHeatLegend();
+      heatCb.addEventListener('change', function(){
+        _ivHeat = heatCb.checked;
+        try { localStorage.setItem('cgxIncHeat', _ivHeat ? '1' : '0'); } catch(e){}
+        _syncHeatLegend();
+        _ivRender();
+      });
+    }
+
+    /* INC-3: "Show all" clears focus filtering */
+    var showAllBtn = document.getElementById('cg-iv-showall');
+    if (showAllBtn) showAllBtn.addEventListener('click', function(){
+      if (window.cgxIncClearFocus) window.cgxIncClearFocus();
+    });
+
+    /* INC-1: clicking the "guarded-out" stat lists the dropped includes */
+    var exclStat = document.getElementById('cg-iv-s-excl');
+    if (exclStat) exclStat.addEventListener('click', function(){ _ivShowExcluded(); });
+
 
     var cBtn = document.getElementById('cgx-inc-close');
     if(cBtn) cBtn.addEventListener('click', function(){ activateSlot(_activeSlotId==='slot2'?'slot2':'slot1'); });
@@ -8337,6 +10889,15 @@ _CGX_EXTRAS_JS = r"""
       var canvas = document.getElementById('cg-iv-canvas');
       if(!canvas||canvas._ivWired) return;
       canvas._ivWired = true;
+
+      /* INC-3: double-click a header to focus its transitive include closure */
+      canvas.addEventListener('dblclick', function(ev){
+        var nodeEl = ev.target.closest ? ev.target.closest('.cg-iv-node') : null;
+        if (!nodeEl) return;
+        ev.preventDefault();
+        var nid = nodeEl.getAttribute('data-nid') || '';
+        if (nid && window.cgxIncIsolate) window.cgxIncIsolate(nid, 0, 'callees');
+      });
 
       /* wheel zoom */
       canvas.addEventListener('wheel', function(ev){
@@ -8387,6 +10948,7 @@ _CGX_EXTRAS_JS = r"""
           _ivNodeDrag = {nodes:dragNodes, sx:ev.clientX, sy:ev.clientY};
         } else {
           ev.preventDefault();
+          if (window._ivClearTrace) _ivClearTrace();
           if (ev.altKey) {
             _ivDrag={sx:ev.clientX,sy:ev.clientY,ox:_ivPanX,oy:_ivPanY};
             canvas.classList.add('iv-panning');
@@ -8453,7 +11015,10 @@ _CGX_EXTRAS_JS = r"""
           var movedDist = Math.abs(ev.clientX-_ivNodeDrag.sx)+Math.abs(ev.clientY-_ivNodeDrag.sy);
           if(movedDist<4 && _ivNodeDrag.nodes.length===1){
             var nid = _ivNodeDrag.nodes[0].id;
-            if(nid) _ivOpenPanel(nid);
+            if(nid) {
+              _ivOpenPanel(nid);
+              if (window.cgTraceEnabled('inc') && typeof _ivApplyTrace === 'function') _ivApplyTrace(nid);
+            }
           }
           _ivNodeDrag=null;
         }
@@ -8492,6 +11057,95 @@ _CGX_EXTRAS_JS = r"""
       }
       return Object.keys(visited);
     }
+
+    /* ── Include-mode flow-trace ──────────────────────────────────────
+       Click a header → colour its downstream/upstream include paths using the
+       shared engine, dimming unreached tiles AND recolouring the SVG arrows
+       along each branch (with the rest dimmed). */
+    var _ivTraceOrigin = null;
+    function _ivEnsureArrowMarker(col) {
+      var svg = document.getElementById('cg-iv-arrows');
+      if (!svg) return '';
+      var defs = svg.querySelector('defs');
+      if (!defs) return '';
+      var id = 'iv-arr-tr-' + col.replace(/[^a-zA-Z0-9]/g, '');
+      if (!document.getElementById(id)) {
+        var m = document.createElementNS('http://www.w3.org/2000/svg','marker');
+        m.setAttribute('id', id);
+        m.setAttribute('markerWidth','10'); m.setAttribute('markerHeight','10');
+        m.setAttribute('refX','9'); m.setAttribute('refY','5');
+        m.setAttribute('orient','auto'); m.setAttribute('markerUnits','strokeWidth');
+        var mp = document.createElementNS('http://www.w3.org/2000/svg','path');
+        mp.setAttribute('d','M0,1 L9,5 L0,9 Z'); mp.setAttribute('fill', col);
+        m.appendChild(mp); defs.appendChild(m);
+      }
+      return id;
+    }
+    function _ivClearTrace() {
+      _ivTraceOrigin = null;
+      Array.prototype.forEach.call(document.querySelectorAll('.cg-iv-node'), function(el) {
+        el.classList.remove('cg-trace-lit', 'cg-trace-merge');
+        el.style.borderColor = '';
+        el.style.boxShadow = '';
+        el.style.opacity = '';
+      });
+      /* Rebuild arrows from scratch → restores default stroke/marker/opacity. */
+      try { _ivDrawArrows(); } catch(e) {}
+    }
+    window._ivClearTrace = _ivClearTrace;
+    function _ivApplyTrace(originId) {
+      _ivClearTrace();
+      var trace = window.cgFlowTraceColors(originId, _ivEdges, window.cgTraceDir('inc'));
+      if (!trace.neighbors.length) return;
+      _ivTraceOrigin = originId;
+      Array.prototype.forEach.call(document.querySelectorAll('.cg-iv-node'), function(el) {
+        var nid = el.getAttribute('data-nid') || '';
+        if (nid === originId) return;
+        var c = trace.color[nid];
+        if (c) {
+          el.classList.add('cg-trace-lit');
+          el.style.borderColor = c;
+          el.style.boxShadow = '0 0 10px ' + c;
+          el.style.opacity = '1';
+          if (trace.merge[nid]) el.classList.add('cg-trace-merge');
+        } else {
+          el.style.opacity = '0.18';
+        }
+      });
+      /* Recolour the SVG arrows along the traced paths; dim the rest. */
+      var svg = document.getElementById('cg-iv-arrows');
+      if (svg) {
+        var isUp = (window.cgTraceDir('inc') === 'upstream');
+        var origStr = String(originId);
+        Array.prototype.forEach.call(svg.querySelectorAll('path.iv-arrow'), function(path) {
+          var from = path.getAttribute('data-from');
+          var to   = path.getAttribute('data-to');
+          var src = isUp ? to : from;
+          var dst = isUp ? from : to;
+          var srcOk = (String(src) === origStr) || trace.color[src];
+          var dc = trace.color[dst];
+          if (srcOk && dc) {
+            path.setAttribute('stroke', dc);
+            path.setAttribute('stroke-width', '3');
+            path.setAttribute('opacity', '1');
+            var mid = _ivEnsureArrowMarker(dc);
+            if (mid) path.setAttribute('marker-end', 'url(#' + mid + ')');
+          } else {
+            path.setAttribute('opacity', '0.08');
+          }
+        });
+      }
+    }
+    function _ivMountTraceControl() {
+      var mount = document.getElementById('cg-iv-trace-mount');
+      if (!mount || mount._wired) return;
+      mount._wired = true;
+      var ctl = window.cgBuildTraceControl('inc',
+        function(enabled) { if (!enabled) _ivClearTrace(); },
+        function(dir) { if (_ivTraceOrigin) _ivApplyTrace(_ivTraceOrigin); });
+      mount.appendChild(ctl);
+    }
+    _ivMountTraceControl();
 
     /* ── escape helper for sidebar dropdown HTML ──────────────────── */
     function _ivEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -8629,6 +11283,32 @@ _CGX_EXTRAS_JS = r"""
     window.cgxIncGetNodes = function() {
       /* Return node list for sidebar search dropdown */
       return _ivNodes.map(function(n){ return {id:n.id, label:n.label, path:n.path, status:n.status}; });
+    };
+
+    /* Nodebook state capture/restore for the Include graph. Captures pan/zoom,
+       search text and every node tile's position so a saved page reopens exactly
+       as the user arranged it. */
+    window.cgxIncGetState = function() {
+      var pos = {};
+      Array.prototype.forEach.call(document.querySelectorAll('.cg-iv-node'), function(el){
+        var nid = el.getAttribute('data-nid');
+        if (nid) pos[nid] = { left: parseFloat(el.style.left)||0, top: parseFloat(el.style.top)||0 };
+      });
+      var inp = document.getElementById('cg-search');
+      return { pan:{x:_ivPanX, y:_ivPanY, z:_ivZoom}, search: inp ? inp.value : '', positions: pos };
+    };
+    window.cgxIncSetState = function(st) {
+      if (!st) return;
+      try {
+        if (st.positions) {
+          Object.keys(st.positions).forEach(function(nid){
+            var el = _ivNodeEls[nid];
+            if (el) { el.style.left = st.positions[nid].left + 'px'; el.style.top = st.positions[nid].top + 'px'; }
+          });
+          setTimeout(_ivDrawArrows, 20);
+        }
+      } catch(e){}
+      if (st.pan) { _ivPanX = st.pan.x; _ivPanY = st.pan.y; _ivZoom = st.pan.z; _ivApplyTransform(); }
     };
 
   } /* end if (ig && incView) */
@@ -8904,6 +11584,18 @@ _CGX_EXTRAS_JS = r"""
       var headInner = '<span class="cgx-mv-toggle"></span>' +
         '<span class="cgx-mv-name">' + esc(key) + '</span>' +
         '<span class="cgx-mv-badge">' + esc(levelLabel || (node.meta && node.meta.func_type) || '') + '</span>';
+      /* Root badge: find best root_rank among functions in this module's hierarchy */
+      var mvRootRank = null;
+      var rootRanksMap = window.CGX_ROOT_RANKS || {};
+      hierarchy.forEach(function(filerec){
+        (filerec.fns || []).forEach(function(pair){
+          var r = rootRanksMap[pair[0]];
+          if (r && (mvRootRank === null || r < mvRootRank)) mvRootRank = r;
+        });
+      });
+      if (mvRootRank === 1) headInner += '<span class="cg-root-badge rank-1">&#x1F451; Root</span>';
+      else if (mvRootRank === 2) headInner += '<span class="cg-root-badge rank-2">&#x2605; Root #2</span>';
+      else if (mvRootRank === 3) headInner += '<span class="cg-root-badge rank-3">&#x2605; Root #3</span>';
       var head = _h('div', {'class':'cgx-mv-head'}, headInner);
       var summary = _h('div', {'class':'cgx-mv-summary'},
         '<span>' + hierarchy.length + ' file(s)</span>' +
@@ -8950,6 +11642,9 @@ _CGX_EXTRAS_JS = r"""
             ev.stopPropagation();
             fns.slice(_mvTopN).forEach(_addFnRow);
             more.remove();
+            if (window.CG_VIRT_DOM && window._cgVirtRefresh) {
+              var _rc = window._cgVirtRefresh(card); if (_rc && _rc.apply) _rc.apply();
+            }
             _mvRedrawArrows();
           });
           fnsBox.appendChild(more);
@@ -8957,6 +11652,9 @@ _CGX_EXTRAS_JS = r"""
         fileEl.querySelector('.cgx-mv-file-head').addEventListener('click', function(ev){
           ev.stopPropagation();
           fileEl.classList.toggle('open');
+          if (window.CG_VIRT_DOM && window._cgVirtRefresh) {
+            var _rc = window._cgVirtRefresh(card); if (_rc && _rc.apply) _rc.apply();
+          }
           _mvRedrawArrows();
         });
         body.appendChild(fileEl);
@@ -8975,6 +11673,10 @@ _CGX_EXTRAS_JS = r"""
     /* Grow canvas to fit. */
     inner.style.minWidth  = (maxX + 80) + 'px';
     inner.style.minHeight = (maxY + 80) + 'px';
+
+    /* PERF-8: virtualise module cards (fit + arrow geometry read each card's own
+       offsetWidth/Height, preserved by the pinned intrinsic-size). */
+    if (window._cgVirtualize) window._cgVirtualize(inner, '.cgx-mv-card');
 
     _mvLoadPositions();
     _mvRedrawArrows();
@@ -9057,9 +11759,16 @@ _CGX_EXTRAS_JS = r"""
       if (moved) {
         _mvSavePositions();
       } else if (dragCards.length === 1) {
-        /* True click — toggle expand/collapse. */
+        /* True click — toggle expand/collapse, then flow-trace (if enabled). */
         card.classList.toggle('open');
+        if (window.CG_VIRT_DOM && window._cgVirtRefresh) {
+          var _rc = window._cgVirtRefresh(card); if (_rc && _rc.apply) _rc.apply();
+        }
         _mvRedrawArrows();
+        if (window.cgTraceEnabled('module') && typeof _mvApplyTrace === 'function') {
+          var _mid = card.getAttribute('data-id') || '';
+          if (_mid) _mvApplyTrace(_mid);
+        }
       }
       moved = false;
       dragCards = [];
@@ -9593,6 +12302,51 @@ _CGX_EXTRAS_JS = r"""
     });
   }
 
+  /* ── Module-mode flow-trace (Folder / Library / Namespace) ───────────
+     Operates on the aggregated card-to-card edges; colours module cards. */
+  var _mvTraceOrigin = null;
+  function _mvClearTrace() {
+    _mvTraceOrigin = null;
+    Array.prototype.forEach.call(document.querySelectorAll('.cgx-mv-card'), function(el) {
+      el.classList.remove('cg-trace-lit', 'cg-trace-merge');
+      el.style.borderColor = '';
+      el.style.boxShadow = '';
+      el.style.opacity = '';
+    });
+  }
+  window._mvClearTrace = _mvClearTrace;
+  function _mvApplyTrace(originId) {
+    _mvClearTrace();
+    var trace = window.cgFlowTraceColors(originId, _mvAggEdges, window.cgTraceDir('module'));
+    if (!trace.neighbors.length) return;
+    _mvTraceOrigin = originId;
+    Object.keys(_mvCardByNodeId).forEach(function(id) {
+      var el = _mvCardByNodeId[id];
+      if (!el) return;
+      if (id === originId) return;
+      var c = trace.color[id];
+      if (c) {
+        el.classList.add('cg-trace-lit');
+        el.style.borderColor = c;
+        el.style.boxShadow = '0 0 10px ' + c;
+        el.style.opacity = '1';
+        if (trace.merge[id]) el.classList.add('cg-trace-merge');
+      } else {
+        el.style.opacity = '0.2';
+      }
+    });
+  }
+  function _mvMountTraceControl() {
+    var mount = document.getElementById('cgx-mv-trace-row');
+    if (!mount || mount._wired) return;
+    mount._wired = true;
+    var ctl = window.cgBuildTraceControl('module',
+      function(enabled) { if (!enabled) _mvClearTrace(); },
+      function(dir) { if (_mvTraceOrigin) _mvApplyTrace(_mvTraceOrigin); });
+    mount.appendChild(ctl);
+  }
+  _mvMountTraceControl();
+
   window.cgxModuleHighlight = function(ids, centerFirst) {
     _mvClearHighlight();
     var seenCards = {};
@@ -9645,6 +12399,37 @@ _CGX_EXTRAS_JS = r"""
     if (mvSearchInput) mvSearchInput.value = q || '';
     _mvRenderDropdown(q || '');
   };
+
+  /* Nodebook state capture/restore for the Module view. Captures pan/zoom, the
+     per-card position + expanded state, top-N and search so a saved page reopens
+     with the user's exact card arrangement. Restores onto the active build. */
+  window.cgxModuleGetState = function() {
+    var cards = {};
+    Array.prototype.forEach.call(document.querySelectorAll('.cgx-mv-card'), function(c){
+      var id = c.getAttribute('data-id');
+      if (id) cards[id] = { left:parseFloat(c.style.left)||0, top:parseFloat(c.style.top)||0,
+                            open:c.classList.contains('open') };
+    });
+    var lvl = (_mvBuiltFor && _mvBuiltFor.indexOf(':') >= 0) ? _mvBuiltFor.split(':')[1] : 'module';
+    return { builtFor:_mvBuiltFor, level:lvl, pan:{x:_mvPanX, y:_mvPanY, z:_mvZoom}, topN:_mvTopN,
+             search:(mvSearchInput?mvSearchInput.value:''), cards:cards };
+  };
+  window.cgxModuleSetState = function(st) {
+    if (!st) return;
+    try {
+      if (st.cards) {
+        Object.keys(st.cards).forEach(function(id){
+          var c = _mvCardByNodeId[id];
+          if (!c) return;
+          c.style.left = st.cards[id].left + 'px';
+          c.style.top  = st.cards[id].top + 'px';
+          if (st.cards[id].open) c.classList.add('open'); else c.classList.remove('open');
+        });
+      }
+    } catch(e){}
+    if (st.pan) { _mvPanX = st.pan.x; _mvPanY = st.pan.y; _mvZoom = st.pan.z; _mvApplyTransform(); }
+    setTimeout(_mvRedrawArrows, 30);
+  };
   document.addEventListener('cg:straight-edges:change', function(){ _mvRedrawArrows(); });
 
   if (mvSearchInput) {
@@ -9691,7 +12476,9 @@ _CGX_EXTRAS_JS = r"""
     if (incEl) { incEl.classList.remove('cg-iv-active'); }
     var mvEl = document.getElementById('cg-module-view');
     if (mvEl) mvEl.classList.remove('active');
-    [btnFn, btnSv, btnVf, btnInc].forEach(function(b){ if (b) b.classList.remove('active'); });
+    var nbEl = document.getElementById('cg-nodebook');
+    if (nbEl) nbEl.style.display = 'none';
+    [btnFn, btnSv, btnVf, btnInc, btnNodebook].forEach(function(b){ if (b) b.classList.remove('active'); });
     var mvCtl = document.getElementById('cgx-mv-controls');
     if (mvCtl) mvCtl.style.display = 'none';
   }
@@ -9785,6 +12572,14 @@ _CGX_EXTRAS_JS = r"""
     setTimeout(function(){ if (window.cgxIncFit) window.cgxIncFit(); }, 50);
   }
 
+  function _activateNodebook() {
+    _hideAllViews();
+    if (btnNodebook) btnNodebook.classList.add('active');
+    var nbEl = document.getElementById('cg-nodebook');
+    if (nbEl) nbEl.style.display = 'flex';
+    if (typeof window.cgNodebookOpen === 'function') window.cgNodebookOpen();
+  }
+
   /* edge-filter implementations per mode — all read window.cgEdgeFilter */
   function _filterNetEdges() {
     var net = _cgxGetNet();
@@ -9835,12 +12630,17 @@ _CGX_EXTRAS_JS = r"""
     script:  { view: 'cg-script-view',  enter: function(){ _safeActivate('Script View',     function(){ _activateScriptForSlot(_activeSlotId); }); }, edgeFilter: _filterScriptEdges },
     module:  { view: 'cg-module-view',  enter: function(){ _safeActivate('Module View',     function(){ _activateModuleForSlot(_activeSlotId); }); }, edgeFilter: _filterModuleEdges },
     varflow: { view: 'cg-varflow-view', enter: function(){ _safeActivate('Variable Flow',   _activateVarFlow); },                              edgeFilter: null },
-    inc:     { view: 'cgx-inc-view',    enter: function(){ _safeActivate('Include Graph',   _activateInclude); },                              edgeFilter: _filterIncludeEdges }
+    inc:     { view: 'cgx-inc-view',    enter: function(){ _safeActivate('Include Graph',   _activateInclude); },                              edgeFilter: _filterIncludeEdges },
+    nodebook:{ view: 'cg-nodebook',     enter: function(){ _safeActivate('Nodebook',        _activateNodebook); },                             edgeFilter: null }
   };
   window.RENDER_MODES = RENDER_MODES;
 
+  /* The Nodebook needs to know which real view was active so "Capture" snapshots
+     the right mode. We remember the last non-nodebook mode here. */
+  window.CG_NB_LAST_MODE = window.CG_NB_LAST_MODE || 'fn';
   window.setViewMode = function(mode) {
     _cgxCurrentMode = mode || 'fn';
+    if (mode && mode !== 'nodebook') window.CG_NB_LAST_MODE = mode;
     if (typeof window._cgSetCurrentMode === 'function') window._cgSetCurrentMode(mode);
     var entry = RENDER_MODES[mode];
     if (entry && entry.enter) {
@@ -9861,6 +12661,19 @@ _CGX_EXTRAS_JS = r"""
   }
   window.activateSlot = activateSlot;
 
+  /* Nodebook: restore a captured module/folder page onto its *original* slot.
+     Folder and Module are both internal mode 'module' but live in different
+     slots (e.g. slot1=folder, slot2=module). The captured state carries
+     `builtFor` = '<slotId>:<level>', so we re-activate that exact slot before
+     the adapter replays card positions — this is what keeps a folder capture
+     and a module capture independent instead of overriding each other. */
+  window.cgxModuleActivateBuilt = function(builtFor){
+    if (!builtFor || builtFor.indexOf(':') < 0){ window.setViewMode('module'); return; }
+    var slotId = builtFor.split(':')[0];
+    if (SLOTS[slotId]){ activateSlot(slotId); }
+    else { window.setViewMode('module'); }
+  };
+
   /* Wire slot buttons */
   if (btnFn) {
     btnFn.replaceWith(btnFn.cloneNode(true));   // strip any pre-existing listeners
@@ -9878,6 +12691,8 @@ _CGX_EXTRAS_JS = r"""
     btnVf.addEventListener('click', function(){ window.setViewMode('varflow'); });
   }
   if (btnInc) btnInc.addEventListener('click', function(){ window.setViewMode('inc'); });
+  if (btnNodebook) btnNodebook.addEventListener('click', function(){ window.setViewMode('nodebook'); });
+  if (btnCapture) btnCapture.addEventListener('click', function(){ if (window.cgNodebookCaptureCurrent) window.cgNodebookCaptureCurrent(); });
 
   // Re-resolve SLOT button references and re-attach (some browsers cache).
   SLOTS.slot1.btn = btnFn;
@@ -9895,6 +12710,8 @@ _CGX_EXTRAS_JS = r"""
     else if (ev.key === '2')   { ev.preventDefault(); activateSlot('slot2'); }
     else if (ev.key === 'v' || ev.key === 'V') { ev.preventDefault(); window.setViewMode('varflow'); }
     else if ((ev.key === 'i' || ev.key === 'I') && btnInc) { ev.preventDefault(); window.setViewMode('inc'); }
+    else if (ev.key === 'n' || ev.key === 'N') { ev.preventDefault(); if (window.cgNodebookCaptureCurrent) window.cgNodebookCaptureCurrent(); }
+    else if (ev.key === 'b' || ev.key === 'B') { ev.preventDefault(); window.setViewMode('nodebook'); }
     else if (ev.key === '/') {
       var s = document.getElementById('cg-search') || document.getElementById('cgx-mv-search');
       if (s) { ev.preventDefault(); s.focus(); s.select(); }
@@ -9920,6 +12737,418 @@ _CGX_EXTRAS_JS = r"""
   if (SLOTS.slot1.level !== 'function') {
     setTimeout(function(){ activateSlot('slot1'); }, 50);
   }
+})();
+</script>
+"""
+
+
+# Nodebook constants appended below
+
+# ------------------------------------------------------------------ #
+# Nodebook — saveable, restorable "favorites" of live views.          #
+# Additive only (Rule 9): empty/inert by default, existing IDs and    #
+# modes untouched. Self-contained (Rule 8): thumbnails are rasterised  #
+# in-browser via an SVG <foreignObject> snapshot of the live DOM (no   #
+# external library/CDN). All five modes capture + restore (Rule 12).   #
+# ------------------------------------------------------------------ #
+
+_NODEBOOK_CSS = r"""
+<style id="cg-nodebook-css">
+.cg-nb-btn-row { display:flex; gap:6px; margin-top:6px; }
+.cg-nb-btn-row .cg-btn { flex:1; }
+#cg-nodebook { display:none; flex:1; height:100vh; overflow:auto; box-sizing:border-box;
+  background:#1a1d24; color:#e6e6e6; padding:18px 22px; flex-direction:column; }
+#cg-nb-header { display:flex; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+#cg-nb-header h2 { margin:0; font-size:18px; font-weight:600; }
+#cg-nb-count { opacity:.65; font-size:13px; }
+#cg-nb-header .cg-nb-spacer { flex:1; }
+#cg-nb-header button { background:#2a2f3a; color:#e6e6e6; border:1px solid #3a4151;
+  border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+#cg-nb-header button:hover { background:#343b48; }
+#cg-nb-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr));
+  gap:16px; align-content:start; }
+.cg-nb-card { background:#222732; border:1px solid #333b49; border-radius:10px;
+  overflow:hidden; display:flex; flex-direction:column; transition:border-color .15s; }
+.cg-nb-card.cg-nb-drag-over { border-color:#5b8cff; }
+.cg-nb-card[draggable="true"] .cg-nb-thumb,
+.cg-nb-card[draggable="true"] .cg-nb-thumb-ph { cursor:grab; }
+.cg-nb-thumb { width:100%; height:140px; object-fit:cover; background:#11141a;
+  display:block; border-bottom:1px solid #333b49; }
+.cg-nb-thumb-ph { width:100%; height:140px; display:flex; align-items:center; justify-content:center;
+  background:#11141a; color:#5b6472; font-size:34px; border-bottom:1px solid #333b49; }
+.cg-nb-body { padding:10px 12px; display:flex; flex-direction:column; gap:6px; }
+.cg-nb-title { font-size:14px; font-weight:600; color:#fff; background:transparent; border:none;
+  border-bottom:1px solid transparent; padding:2px 0; width:100%; box-sizing:border-box; }
+.cg-nb-title:focus { outline:none; border-bottom-color:#5b8cff; }
+.cg-nb-meta { font-size:11px; opacity:.6; display:flex; gap:8px; align-items:center; }
+.cg-nb-badge { background:#33405e; color:#bcd0ff; border-radius:4px; padding:1px 6px; font-size:10px; }
+.cg-nb-actions { display:flex; gap:6px; margin-top:4px; }
+.cg-nb-actions button { flex:1; background:#2a2f3a; color:#dfe6f2; border:1px solid #3a4151;
+  border-radius:6px; padding:5px 0; cursor:pointer; font-size:12px; }
+.cg-nb-actions button:hover { background:#343b48; }
+.cg-nb-actions button.cg-nb-del:hover { background:#5a2730; border-color:#7a3540; }
+#cg-nb-empty { opacity:.6; font-size:14px; padding:40px 0; text-align:center; grid-column:1/-1; }
+#cg-nb-toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+  background:#2a2f3a; color:#fff; border:1px solid #3a4151; border-radius:8px;
+  padding:10px 16px; font-size:13px; z-index:99999; opacity:0; pointer-events:none;
+  transition:opacity .2s; }
+#cg-nb-toast.show { opacity:1; }
+body[data-theme="light"] #cg-nodebook { background:#f5f6f8; color:#222; }
+body[data-theme="light"] #cg-nb-header button { background:#fff; color:#222; border-color:#cdd3dd; }
+body[data-theme="light"] .cg-nb-card { background:#fff; border-color:#dde1e8; }
+body[data-theme="light"] .cg-nb-thumb, body[data-theme="light"] .cg-nb-thumb-ph { background:#eef0f3; }
+body[data-theme="light"] .cg-nb-title { color:#111; }
+body[data-theme="light"] .cg-nb-actions button { background:#f0f2f5; color:#222; border-color:#cdd3dd; }
+</style>
+"""
+
+
+_NODEBOOK_HTML = r"""
+<div id="cg-nodebook">
+  <div id="cg-nb-header">
+    <h2>&#128218; Nodebook</h2>
+    <span id="cg-nb-count">0 pages</span>
+    <span class="cg-nb-spacer"></span>
+    <button id="cg-nb-export" title="Export this Nodebook to a .nodebook.json file">&#11015; Export</button>
+    <button id="cg-nb-import" title="Import pages from a .nodebook.json file">&#11014; Import</button>
+    <button id="cg-nb-clear" title="Remove all pages">&#128465; Clear all</button>
+    <input id="cg-nb-import-file" type="file" accept=".json,application/json" style="display:none">
+  </div>
+  <div id="cg-nb-grid"></div>
+</div>
+<div id="cg-nb-toast"></div>
+"""
+
+
+_NODEBOOK_JS = r"""
+<script>
+/* Nodebook engine. Self-contained, additive, runs after the sidebar + extras
+   IIFEs so every per-mode adapter (window.CG_NB_ADAPTERS) and the cgx state
+   helpers already exist. */
+(function(){
+  "use strict";
+
+  window.CG_NB_ADAPTERS = window.CG_NB_ADAPTERS || {};
+
+  /* Include + Module adapters: thin wrappers over the GetState/SetState helpers
+     defined in the extras IIFE. Registered here so all five modes are present. */
+  if (!window.CG_NB_ADAPTERS['inc']) window.CG_NB_ADAPTERS['inc'] = {
+    label:'Include Graph',
+    title:function(st){ var s = st && st.search; return s ? ('Include \u00b7 ' + s) : 'Include Graph'; },
+    capture:function(){ try { return window.cgxIncGetState ? window.cgxIncGetState() : {}; } catch(e){ return {}; } },
+    restore:function(st){ try { if (window.cgxIncSetState) window.cgxIncSetState(st); } catch(e){} }
+  };
+  if (!window.CG_NB_ADAPTERS['module']) window.CG_NB_ADAPTERS['module'] = {
+    label:'Module View',
+    title:function(st){
+      var lvl = (st && st.level) ? (st.level.charAt(0).toUpperCase() + st.level.slice(1)) : 'Module';
+      var s = st && st.search;
+      return s ? (lvl + ' \u00b7 ' + s) : (lvl + ' View');
+    },
+    capture:function(){ try { return window.cgxModuleGetState ? window.cgxModuleGetState() : {}; } catch(e){ return {}; } },
+    restore:function(st){ try { if (window.cgxModuleSetState) window.cgxModuleSetState(st); } catch(e){} }
+  };
+
+  function _nbKey(){ return (window.cgGraphId || 'default') + ':cg_nodebook_v1'; }
+  function _nbAdapter(mode){ return window.CG_NB_ADAPTERS[mode] || null; }
+
+  function _nbLoad(){
+    try {
+      var raw = localStorage.getItem(_nbKey());
+      if (raw){ var b = JSON.parse(raw); if (b && b.pages) return b; }
+    } catch(e){}
+    return { version:1, graphId:(window.cgGraphId || 'default'), pages:[] };
+  }
+  function _nbSave(book){
+    try { localStorage.setItem(_nbKey(), JSON.stringify(book)); return true; }
+    catch(e){
+      try {
+        book.pages.forEach(function(p){ p.thumb = null; });
+        localStorage.setItem(_nbKey(), JSON.stringify(book));
+        _nbToast('Storage full \u2014 pages saved without thumbnails');
+        return true;
+      } catch(e2){ _nbToast('Could not save Nodebook (storage full)'); return false; }
+    }
+  }
+
+  var _toastTimer = null;
+  function _nbToast(msg){
+    var t = document.getElementById('cg-nb-toast');
+    if (!t) return;
+    t.textContent = msg; t.classList.add('show');
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(function(){ t.classList.remove('show'); }, 2400);
+  }
+
+  /* Rasterise the current live view to a JPEG dataURL. For the vis.js function
+     view we use the native canvas; for DOM modes we serialise the node into an
+     SVG <foreignObject> with all page styles inlined, then draw it to a canvas.
+     Fully offline. On any failure we return null and the card shows a glyph. */
+  var _NB_SEL = { fn:'#mynetwork', script:'#cg-script-view', varflow:'#cg-varflow-view',
+                  inc:'#cgx-inc-view', module:'#cg-module-view' };
+  function _nbRasterize(mode, cb){
+    try {
+      if (mode === 'fn'){
+        var cv = document.querySelector('#mynetwork canvas');
+        if (cv){ try { return cb(cv.toDataURL('image/jpeg', 0.6)); } catch(e){} }
+      }
+      var node = document.querySelector(_NB_SEL[mode] || '');
+      if (!node){ return cb(null); }
+      var rect = node.getBoundingClientRect();
+      var w = Math.max(1, Math.round(rect.width)), h = Math.max(1, Math.round(rect.height));
+      if (w < 4 || h < 4){ return cb(null); }
+      var scale = Math.min(1, 480 / w);
+      var styleText = '';
+      Array.prototype.forEach.call(document.querySelectorAll('style'), function(s){ styleText += s.textContent + '\n'; });
+      var clone = node.cloneNode(true);
+      clone.style.display = '';
+      var xml = new XMLSerializer().serializeToString(clone);
+      var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '">'
+              + '<defs><style><![CDATA[' + styleText + ']]></style></defs>'
+              + '<foreignObject width="100%" height="100%">'
+              + '<div xmlns="http://www.w3.org/1999/xhtml" style="width:' + w + 'px;height:' + h + 'px;">'
+              + xml + '</div></foreignObject></svg>';
+      var img = new Image();
+      img.onload = function(){
+        try {
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(w * scale));
+          canvas.height = Math.max(1, Math.round(h * scale));
+          var ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#11141a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          cb(canvas.toDataURL('image/jpeg', 0.6));
+        } catch(e){ cb(null); }
+      };
+      img.onerror = function(){ cb(null); };
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    } catch(e){ cb(null); }
+  }
+
+  function _nbCapture(targetId){
+    var mode = window.CG_NB_LAST_MODE || 'fn';
+    var ad = _nbAdapter(mode);
+    if (!ad){ _nbToast('Nothing to capture in this mode'); return; }
+    var state = {};
+    try { state = ad.capture() || {}; } catch(e){ state = {}; }
+    var title;
+    try { title = ad.title ? ad.title(state) : (ad.label || mode); } catch(e){ title = ad.label || mode; }
+    _nbRasterize(mode, function(thumb){
+      var book = _nbLoad();
+      if (targetId){
+        var pg = null;
+        for (var i = 0; i < book.pages.length; i++){ if (book.pages[i].id === targetId){ pg = book.pages[i]; break; } }
+        if (pg){
+          pg.state = state; pg.thumb = thumb || pg.thumb; pg.updatedAt = Date.now();
+          _nbSave(book); _nbToast('Updated "' + pg.title + '"');
+          _nbRenderGalleryIfOpen();
+        }
+        return;
+      }
+      var page = { id:'nb_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
+                   title:title, mode:mode, thumb:(thumb || null),
+                   createdAt:Date.now(), updatedAt:Date.now(), state:state };
+      book.pages.push(page);
+      _nbSave(book);
+      _nbToast('Captured "' + title + '" \u2192 Nodebook');
+      _nbRenderGalleryIfOpen();
+    });
+  }
+  window.cgNodebookCaptureCurrent = function(){ _nbCapture(null); };
+
+  function _nbOpenPage(page){
+    if (!page) return;
+    var st = page.state || {};
+    /* Module/folder pages must restore onto their captured slot (not whatever
+       slot happens to be active) so separate captures stay independent. */
+    if (page.mode === 'module' && st.builtFor && window.cgxModuleActivateBuilt){
+      window.cgxModuleActivateBuilt(st.builtFor);
+    } else {
+      try { window.setViewMode(page.mode); } catch(e){}
+    }
+    var ad = _nbAdapter(page.mode);
+    if (ad && ad.restore){
+      setTimeout(function(){ try { ad.restore(page.state); } catch(e){} }, 300);
+    }
+  }
+
+  function _nbDelete(id){
+    var book = _nbLoad();
+    book.pages = book.pages.filter(function(p){ return p.id !== id; });
+    _nbSave(book); _nbRenderGallery();
+  }
+  function _nbRename(id, title){
+    var book = _nbLoad();
+    book.pages.forEach(function(p){ if (p.id === id){ p.title = title; p.updatedAt = Date.now(); } });
+    _nbSave(book);
+  }
+
+  var _dragId = null;
+  function _nbReorder(srcId, beforeId){
+    if (srcId === beforeId) return;
+    var book = _nbLoad();
+    var idx = -1, i;
+    for (i = 0; i < book.pages.length; i++){ if (book.pages[i].id === srcId){ idx = i; break; } }
+    if (idx < 0) return;
+    var moved = book.pages.splice(idx, 1)[0];
+    if (beforeId == null){ book.pages.push(moved); }
+    else {
+      var bi = -1;
+      for (i = 0; i < book.pages.length; i++){ if (book.pages[i].id === beforeId){ bi = i; break; } }
+      if (bi < 0) book.pages.push(moved); else book.pages.splice(bi, 0, moved);
+    }
+    _nbSave(book); _nbRenderGallery();
+  }
+
+  function _fmtDate(ts){
+    try { var d = new Date(ts); return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+    catch(e){ return ''; }
+  }
+
+  function _nbCard(page){
+    var card = document.createElement('div');
+    card.className = 'cg-nb-card';
+    card.setAttribute('draggable', 'true');
+    card.dataset.id = page.id;
+
+    if (page.thumb){
+      var img = document.createElement('img');
+      img.className = 'cg-nb-thumb'; img.src = page.thumb; img.alt = page.title;
+      card.appendChild(img);
+    } else {
+      var ph = document.createElement('div');
+      ph.className = 'cg-nb-thumb-ph'; ph.textContent = '\uD83D\uDCC4';
+      card.appendChild(ph);
+    }
+
+    var body = document.createElement('div'); body.className = 'cg-nb-body';
+    var titleInp = document.createElement('input');
+    titleInp.className = 'cg-nb-title'; titleInp.value = page.title || '(untitled)';
+    titleInp.title = 'Click to rename';
+    titleInp.addEventListener('change', function(){ _nbRename(page.id, titleInp.value); });
+    titleInp.addEventListener('keydown', function(ev){ if (ev.key === 'Enter'){ titleInp.blur(); } });
+    titleInp.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+    body.appendChild(titleInp);
+
+    var meta = document.createElement('div'); meta.className = 'cg-nb-meta';
+    var badge = document.createElement('span'); badge.className = 'cg-nb-badge';
+    var ad = _nbAdapter(page.mode);
+    var badgeText = (ad && ad.label) ? ad.label : page.mode;
+    if (page.mode === 'module' && page.state && page.state.level){
+      badgeText = page.state.level.charAt(0).toUpperCase() + page.state.level.slice(1) + ' View';
+    }
+    badge.textContent = badgeText;
+    meta.appendChild(badge);
+    var dt = document.createElement('span'); dt.textContent = _fmtDate(page.updatedAt || page.createdAt);
+    meta.appendChild(dt);
+    body.appendChild(meta);
+
+    var actions = document.createElement('div'); actions.className = 'cg-nb-actions';
+    var openB = document.createElement('button'); openB.textContent = 'Open';
+    openB.addEventListener('click', function(){ _nbOpenPage(page); });
+    var updB = document.createElement('button'); updB.textContent = 'Update';
+    updB.title = 'Re-capture the current live view into this page (switch to its mode first)';
+    updB.addEventListener('click', function(){
+      if ((window.CG_NB_LAST_MODE || 'fn') !== page.mode){
+        _nbToast('Open this page first, arrange it, then Update');
+        return;
+      }
+      /* Folder vs Module share mode 'module' — guard on the captured level too so
+         Update never clobbers a folder page with module state (or vice versa). */
+      if (page.mode === 'module' && page.state && page.state.builtFor &&
+          window.cgxModuleGetState){
+        var cur = null;
+        try { cur = window.cgxModuleGetState(); } catch(e){}
+        if (cur && cur.builtFor && cur.builtFor !== page.state.builtFor){
+          _nbToast('Open this page first, arrange it, then Update');
+          return;
+        }
+      }
+      _nbCapture(page.id);
+    });
+    var delB = document.createElement('button'); delB.className = 'cg-nb-del'; delB.textContent = 'Delete';
+    delB.addEventListener('click', function(){ _nbDelete(page.id); });
+    actions.appendChild(openB); actions.appendChild(updB); actions.appendChild(delB);
+    body.appendChild(actions);
+    card.appendChild(body);
+
+    card.addEventListener('dragstart', function(ev){ _dragId = page.id; try { ev.dataTransfer.effectAllowed = 'move'; } catch(e){} });
+    card.addEventListener('dragover', function(ev){ ev.preventDefault(); card.classList.add('cg-nb-drag-over'); });
+    card.addEventListener('dragleave', function(){ card.classList.remove('cg-nb-drag-over'); });
+    card.addEventListener('drop', function(ev){ ev.preventDefault(); card.classList.remove('cg-nb-drag-over');
+      if (_dragId && _dragId !== page.id){ _nbReorder(_dragId, page.id); } _dragId = null; });
+    return card;
+  }
+
+  function _nbRenderGallery(){
+    var grid = document.getElementById('cg-nb-grid');
+    var count = document.getElementById('cg-nb-count');
+    if (!grid) return;
+    var book = _nbLoad();
+    grid.innerHTML = '';
+    if (count) count.textContent = book.pages.length + (book.pages.length === 1 ? ' page' : ' pages');
+    if (!book.pages.length){
+      var empty = document.createElement('div'); empty.id = 'cg-nb-empty';
+      empty.textContent = 'No pages yet. Open any view, arrange it, then press \u201c\u2795 Capture\u201d (or N) to add it here.';
+      grid.appendChild(empty);
+      return;
+    }
+    book.pages.forEach(function(p){ grid.appendChild(_nbCard(p)); });
+  }
+  window.cgNodebookRenderGallery = _nbRenderGallery;
+  function _nbRenderGalleryIfOpen(){
+    var nb = document.getElementById('cg-nodebook');
+    if (nb && nb.style.display !== 'none') _nbRenderGallery();
+  }
+  window.cgNodebookOpen = function(){ _nbRenderGallery(); };
+
+  function _nbExport(){
+    var book = _nbLoad();
+    var blob = new Blob([JSON.stringify(book, null, 2)], {type:'application/json'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = (window.cgGraphId || 'graph') + '.nodebook.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  }
+  function _nbImport(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      try {
+        var imported = JSON.parse(reader.result);
+        if (!imported || !imported.pages){ _nbToast('Not a valid .nodebook.json file'); return; }
+        var book = _nbLoad();
+        var existing = {}; book.pages.forEach(function(p){ existing[p.id] = 1; });
+        var added = 0;
+        imported.pages.forEach(function(p){ if (p && p.id && !existing[p.id]){ book.pages.push(p); added++; } });
+        _nbSave(book); _nbRenderGallery();
+        _nbToast('Imported ' + added + ' page' + (added === 1 ? '' : 's'));
+      } catch(e){ _nbToast('Could not read file'); }
+    };
+    reader.readAsText(file);
+  }
+
+  function _wireNodebook(){
+    var exp = document.getElementById('cg-nb-export');
+    if (exp) exp.addEventListener('click', _nbExport);
+    var imp = document.getElementById('cg-nb-import');
+    var impFile = document.getElementById('cg-nb-import-file');
+    if (imp && impFile){
+      imp.addEventListener('click', function(){ impFile.click(); });
+      impFile.addEventListener('change', function(){ if (impFile.files && impFile.files[0]){ _nbImport(impFile.files[0]); impFile.value = ''; } });
+    }
+    var clr = document.getElementById('cg-nb-clear');
+    if (clr) clr.addEventListener('click', function(){
+      var book = _nbLoad();
+      if (!book.pages.length){ return; }
+      if (window.confirm('Remove all ' + book.pages.length + ' Nodebook pages? This cannot be undone.')){
+        book.pages = []; _nbSave(book); _nbRenderGallery();
+      }
+    });
+  }
+
+  if (document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', _wireNodebook); }
+  else { _wireNodebook(); }
 })();
 </script>
 """
