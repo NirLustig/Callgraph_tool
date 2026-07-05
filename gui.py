@@ -114,7 +114,11 @@ _TIP = {
         "HTML  Interactive graph in your browser.\n"
         "DOT   Graphviz source text file.\n"
         "SVG   Vector image — requires Graphviz on PATH.\n"
-        "PNG   Raster image — requires Graphviz on PATH."
+        "PNG   Raster image — requires Graphviz on PATH.\n"
+        "Agent(JSON)  Knowledge Pack for an offline AI agent —\n"
+        "             writes a folder <output>.knowledge/ with\n"
+        "             manifest.json + the full graph as JSON\n"
+        "             (no browser needed)."
     ),
     "config": (
         "Optional. YAML or JSON config (see config.example.yaml).\n"
@@ -647,10 +651,18 @@ class App:
         fmt_row = ttk.Frame(req)
         fmt_row.grid(row=3, column=1, columnspan=3, sticky=tk.W, padx=(6, 4))
         self.format_vars: dict[str, tk.BooleanVar] = {}
-        for fmt in ("html", "dot", "svg", "png"):
+        # (cli_value, checkbox_label) — cli_value is passed verbatim to --formats.
+        _FORMAT_CHOICES = [
+            ("html", "HTML"),
+            ("dot", "DOT"),
+            ("svg", "SVG"),
+            ("png", "PNG"),
+            ("pack", "Agent(JSON)"),
+        ]
+        for fmt, label in _FORMAT_CHOICES:
             var = tk.BooleanVar(value=(fmt == "html"))
             self.format_vars[fmt] = var
-            ttk.Checkbutton(fmt_row, text=fmt.upper(), variable=var).pack(
+            ttk.Checkbutton(fmt_row, text=label, variable=var).pack(
                 side=tk.LEFT, padx=(0, 14))
         _info(req, _TIP["formats"]).grid(row=3, column=4)
 
@@ -841,6 +853,7 @@ class App:
                 ("DOT file", "*.dot"),
                 ("SVG file", "*.svg"),
                 ("PNG file", "*.png"),
+                ("Agent Knowledge Pack (base name → .knowledge/)", "*.*"),
                 ("No extension — multi-format", "*.*"),
             ],
         )

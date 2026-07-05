@@ -46,6 +46,14 @@ def render_graph(
         elif fmt in ("svg", "png", "dot"):
             from .dot_renderer import DotRenderer
             renderer = DotRenderer(config, output_format=fmt)
+        elif fmt == "agent":
+            # Single-file, agent-readable JSON export (<output>.agent.json).
+            from .agent_renderer import AgentRenderer
+            renderer = AgentRenderer(config)
+        elif fmt == "pack":
+            # Multi-file agent knowledge pack (<output>.knowledge/).
+            from .agent_pack import AgentPackRenderer
+            renderer = AgentPackRenderer(config)
         else:
             raise ValueError(f"Unknown output format: {fmt!r}")
 

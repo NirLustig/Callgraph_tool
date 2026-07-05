@@ -72,9 +72,16 @@ Examples:
     parser.add_argument(
         "--formats", "-f",
         nargs="+",
-        choices=["html", "svg", "png", "dot"],
+        choices=["html", "svg", "png", "dot", "agent", "pack"],
         metavar="FORMAT",
-        help="Output format(s): html, svg, png, dot (overrides config)",
+        help="Output format(s): html, svg, png, dot, agent (LLM-readable JSON), "
+             "pack (multi-file agent knowledge pack) (overrides config)",
+    )
+    parser.add_argument(
+        "--agent-shards",
+        action="store_true",
+        help="For --formats agent: shard the JSON into a <output>.agent/ directory "
+             "(index.json + per-module/-file shards) for progressive disclosure",
     )
     parser.add_argument(
         "--entry", "-e",
@@ -222,6 +229,8 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.output.max_nodes = args.max_nodes
     if args.summary_by_file:
         cfg.output.summary_by_file = True
+    if getattr(args, "agent_shards", False):
+        cfg.output.agent_shards = True
     if args.compile_commands is not None:
         cfg.build.compile_commands = args.compile_commands
     if args.view_slot_1 is not None:

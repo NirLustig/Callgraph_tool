@@ -64,6 +64,9 @@ class OutputConfig:
     #   cards via CSS content-visibility, keeping big-solution graphs responsive.
     #   "auto" (default) = enable above a node-count threshold; True = always;
     #   False = never (legacy behaviour, every node fully laid out).
+    agent_shards: bool = False        # agent-export: shard the `agent` JSON into a
+    #   `<output>.agent/` directory (index.json + per-module/-file shards) for
+    #   progressive disclosure on large solutions. Default = single .agent.json.
 
 
 @dataclass
@@ -193,6 +196,7 @@ def _dict_to_config(data: dict) -> Config:
             summary_by_file=o.get("summary_by_file", cfg.output.summary_by_file),
             compress_payload=o.get("compress_payload", cfg.output.compress_payload),
             virtualize_dom=o.get("virtualize_dom", cfg.output.virtualize_dom),
+            agent_shards=o.get("agent_shards", cfg.output.agent_shards),
         )
 
     if "build" in data:

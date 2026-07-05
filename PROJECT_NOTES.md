@@ -23,7 +23,7 @@ Supported inputs:
 
 Supported languages: Python (`ast`), C (Tree-sitter), C++ (Tree-sitter), MATLAB (regex)
 
-Supported output formats: `html`, `dot`, `svg`, `png`
+Supported output formats: `html`, `dot`, `svg`, `png`, `agent` (LLM-readable JSON), `pack` (agent knowledge-pack directory)
 
 ---
 
@@ -65,6 +65,10 @@ callgraph/
                           (configurable view slots, include-graph mode, build-info &
                            architecture sidebar panels, confidence-styled edges)
     dot_renderer.py     — DOT/SVG/PNG output via Graphviz
+    agent_renderer.py   — `agent` format: single <out>.agent.json (LLM-readable,
+                          portable, both-direction adjacency; --agent-shards → <out>.agent/ dir)
+    agent_pack.py       — `pack` format: <out>.knowledge/ dir (manifest + *.jsonl +
+                          indexes + obsidian_agent_instructions.md) for offline agents
 ```
 
 ---
@@ -751,3 +755,4 @@ Key test files:
 | Variable Flow rendering bug | `html_renderer.py` → `_build_var_flow_data`, `_vfBuildFlowChain`, `_vfBuildGraph` |
 | Resolution / filter bug | `callgraph/graph/builder.py`, `callgraph/graph/filters.py` |
 | DOT / SVG / PNG output | `callgraph/renderers/dot_renderer.py` |
+| Agent export (`agent` JSON / `pack` dir) | `callgraph/renderers/agent_renderer.py`, `callgraph/renderers/agent_pack.py` |

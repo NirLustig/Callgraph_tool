@@ -191,6 +191,27 @@ python callgraph_tool.py --help
 | `dot` | Graphviz DOT source text — always written |
 | `svg` | Scalable vector graphic *(requires Graphviz binary)* |
 | `png` | Raster image *(requires Graphviz binary)* |
+| `agent` | 🤖 **LLM-readable JSON** — a single `<output>.agent.json` describing the whole architecture (functions, both-direction call adjacency, module/file/function levels, hotspots, cycles, violations) for an **offline coding agent** to read without opening the HTML. Add `--agent-shards` to split it into a `<output>.agent/` directory for progressive disclosure on large solutions. |
+| `pack` | 🤖 **Agent knowledge pack** — a `<output>.knowledge/` directory (`manifest.json`, `*.jsonl` records, `indexes.json`, …) plus `obsidian_agent_instructions.md` telling an offline agent how to turn the pack into a regeneratable Markdown/Obsidian vault. |
+
+> **Offline agent hand-off.** `agent` and `pack` are built for an air-gapped workflow: run the
+> tool, then point your local VS Code coding agent at the generated JSON so it can reason about
+> call relationships, entry points, and hotspots directly. Every path is project-root-relative and
+> the `agent` JSON is deterministic (byte-identical for unchanged input), so it diffs cleanly and
+> can be regenerated as a living knowledge source.
+
+### Agent / pack examples
+
+```bash
+# Single LLM-readable JSON document
+python callgraph_tool.py --project ./my_project --formats agent --output graph
+
+# Sharded agent export (index.json + per-module / per-file shards)
+python callgraph_tool.py --project ./my_project --formats agent --agent-shards --output graph
+
+# Full multi-file knowledge pack (for building an Obsidian vault offline)
+python callgraph_tool.py --project ./my_project --formats pack --output graph
+```
 
 ---
 
@@ -218,9 +239,10 @@ variables:
   names: ["buf_size", "mode", "result"]   # variables to trace in Variable Flow
 
 output:
-  formats: ["html", "svg"]
+  formats: ["html", "svg"]   # also: agent (LLM JSON), pack (agent knowledge dir)
   layout: "hierarchical"   # or "force"
   max_nodes: 300
+  agent_shards: false      # true = shard `agent` JSON into <output>.agent/ for large projects
 
 parser:
   expand_macros: true      # expand #define macros before parsing (C/C++)
