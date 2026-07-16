@@ -189,6 +189,9 @@ class CppParser(BaseParser):
         # files (class declared in a header, methods defined in a .cpp).
         self.class_registry: dict[str, ClassInfo] = {}
         self._registry_lock = threading.Lock()
+        # Type Nodes Mode: shared struct/union/enum/typedef/class registry.
+        self.type_registry: dict = {}
+        self._type_lock = threading.Lock()
 
     def _get_parser(self):
         p = getattr(self._tls, "parser", None)
@@ -235,6 +238,21 @@ class CppParser(BaseParser):
                         master.bases.update(info.bases)
                         master.virtual_methods.update(info.virtual_methods)
         self._tls.file_classes = {}
+
+        # Type Nodes Mode: collect struct/union/enum/typedef/class definitions.
+        if getattr(self.config.output, "type_mode", True):
+            try:
+                from ._type_extract import extract_types_from_tree
+                type_defs = extract_types_from_tree(
+                    tree.root_node, source_bytes, str(path), self.LANGUAGE_NAME
+                )
+                if type_defs:
+                    with self._type_lock:
+                        for td in type_defs:
+                            self.type_registry.setdefault(td.type_id, td)
+            except Exception:
+                pass   # type extraction never breaks the parse (graceful degradation)
+
         return functions, calls
 
     def _walk(

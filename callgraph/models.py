@@ -307,6 +307,105 @@ class IncludeGraph:
 
 
 # ---------------------------------------------------------------- #
+# Type graph (Type Nodes Mode)                                      #
+# ---------------------------------------------------------------- #
+
+# Edge kinds between types (see TypeEdge.kind).
+TYPE_EDGE_KINDS = (
+    "contains_value",     # member held by value (composition) — participates in layout
+    "contains_pointer",   # member held via pointer (aggregation) — arc only, not layered
+    "array_of",           # member is an array of the target type
+    "alias_of",           # typedef alias → underlying type
+    "inherits",           # C++ base class (upward) — reserved for C++ extraction
+)
+
+# TypeDef.kind values.
+TYPE_KINDS = ("struct", "union", "enum", "typedef", "class")
+
+
+@dataclass(slots=True)
+class TypeMember:
+    """One field of a struct/union (or a typedef's underlying reference).
+
+    ``type_text`` is stored verbatim as written in source and is what the UI
+    displays; ``canonical_type`` is filled by the type builder with the resolved
+    project ``type_id`` (or left ``None`` for primitives / external types). A
+    resolution miss therefore degrades to an unlinked chip, never a wrong label.
+    """
+    name: str
+    type_text: str                          # verbatim base type as written
+    ref_type: Optional[str] = None          # raw referenced type token (tag/alias) for resolution
+    canonical_type: Optional[str] = None    # resolved project type_id (set by builder)
+    is_pointer: int = 0                      # pointer depth (0 = held by value)
+    array_dims: list = field(default_factory=list)   # e.g. ["32"], ["N", "M"]
+    bitfield_width: Optional[int] = None
+    is_func_ptr: bool = False
+    func_ptr_signature: Optional[str] = None
+    anon_child_id: Optional[str] = None      # links to a synthesized anonymous nested TypeDef
+    line: int = 0
+
+
+@dataclass(slots=True)
+class TypeDef:
+    """A struct / union / enum / typedef / class definition."""
+    type_id: str                             # line-independent: "<relpath>::<tag_or_alias>"
+    kind: str                                # see TYPE_KINDS
+    tag_name: Optional[str] = None           # e.g. "_Foo"
+    aliases: list = field(default_factory=list)      # typedef names, e.g. ["Foo", "FooT"]
+    file: str = ""                           # root-relative once builder normalises it
+    line_start: int = 0
+    line_end: int = 0
+    members: list = field(default_factory=list)      # list[TypeMember]
+    enum_values: list = field(default_factory=list)  # list[(name, value_text)]
+    is_anonymous: bool = False
+    parent_type_id: Optional[str] = None     # for anonymous nested types
+    bases: list = field(default_factory=list)        # C++ base class tokens (inheritance)
+    attributes: dict = field(default_factory=dict)   # packed / align / etc.
+    language: Optional[str] = None
+    doc_comment: Optional[str] = None        # leading comment (tooltips)
+    # typedef-only: raw underlying type token + pointer depth of the alias
+    alias_target: Optional[str] = None
+    alias_pointer_depth: int = 0
+    used_by_functions: list = field(default_factory=list)  # function node_ids (builder)
+
+    @property
+    def display_name(self) -> str:
+        """Primary label: first typedef alias if present, else the tag."""
+        if self.aliases:
+            return self.aliases[0]
+        if self.tag_name:
+            return self.tag_name
+        return f"<anon {self.kind}>"
+
+
+@dataclass(slots=True)
+class TypeEdge:
+    """A directed relationship between two TypeDefs (see TYPE_EDGE_KINDS)."""
+    src_type_id: str
+    dst_type_id: str
+    kind: str
+    member_names: list = field(default_factory=list)  # members of src of this type (collapsed)
+    count: int = 1                           # number of such members
+
+
+@dataclass
+class TypeGraph:
+    """Assembled type graph: all types (nodes) and their relationships (edges)."""
+    types: dict = field(default_factory=dict)          # type_id -> TypeDef
+    edges: list = field(default_factory=list)          # list[TypeEdge]
+    roots: list = field(default_factory=list)          # ranked main-structure type_ids
+    stats: dict = field(default_factory=dict)
+
+    def stats_dict(self) -> dict:
+        return {
+            "types": len(self.types),
+            "edges": len(self.edges),
+            "roots": len(self.roots),
+            "members": sum(len(t.members) for t in self.types.values()),
+        }
+
+
+# ---------------------------------------------------------------- #
 # CallGraph (extended)                                              #
 # ---------------------------------------------------------------- #
 
@@ -326,6 +425,7 @@ class CallGraph:
     render_level: RenderLevel = RenderLevel.FUNCTION
     project_root: Optional[str] = None      # absolute project root if known
     matlab_project: Optional[MatlabProjectInfo] = None   # G10: MATLAB path/project metadata
+    type_graph: Optional["TypeGraph"] = None   # Type Nodes Mode: struct/union/enum/typedef graph
 
     def add_function(self, fn: FunctionDef) -> None:
         self.functions[fn.node_id] = fn

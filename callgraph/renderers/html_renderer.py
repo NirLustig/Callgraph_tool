@@ -325,14 +325,22 @@ _SL_COMPONENT_MARGIN_Y = 600.0
 _SL_MAX_PACKING_ROW_WIDTH = 10000.0
 _SL_X_COMPACT_PASSES = 4
 
+# --- LAY-4: two-level clustered (file centroids + micro members) ------- #
+_SL_L2_MIN_NODES = 220
+_SL_L2_MIN_FILES = 8
+_SL_L2_CLUSTER_PAD_X = 260.0
+_SL_L2_CLUSTER_PAD_Y = 180.0
+_SL_L2_LAYER_GAP_SCALE = 1.30
+_SL_L2_NODE_GAP_SCALE = 1.15
+
 # --- Size-aware spacing (prevents node overlap) ----------------------- #
 # vis.js renders nodes as monospace 11px "box" shapes; box width follows the
 # widest label line. These estimate the real footprint so layout reserves
 # enough room and nothing is placed on top of another node.
 _SL_CHAR_W = 7.2          # px per monospace char at the rendered font size
-_SL_LABEL_PAD_X = 30.0    # box horizontal padding (both sides)
+_SL_LABEL_PAD_X = 40.0    # box horizontal padding (both sides, incl. premium margin)
 _SL_LINE_H = 16.0         # px per label line
-_SL_LABEL_PAD_Y = 24.0    # box vertical padding
+_SL_LABEL_PAD_Y = 30.0    # box vertical padding (incl. premium margin)
 _SL_MIN_NODE_W = 90.0
 _SL_MIN_NODE_H = 44.0
 _SL_PAD_X = 80.0          # min clear gap between two node boxes in a row
@@ -980,6 +988,128 @@ def _sl_diagnostics(stats: dict) -> None:
     )
 
 
+def _sl_layout_l2_clustered(
+    all_nodes: set[str],
+    successors: dict[str, set[str]],
+    predecessors: dict[str, set[str]],
+    name_of: dict[str, str],
+    file_of: dict[str, str],
+    line_of: dict[str, int],
+    node_sizes: dict[str, tuple[float, float]],
+    layer_gap: float,
+    node_gap: float,
+    sweeps: int,
+) -> dict[str, tuple[float, float]] | None:
+    """LAY-4: two-level clustered layout.
+
+    Macro level: one centroid per source file (cluster graph with aggregated
+    inter-file call edges).
+    Micro level: functions inside each file cluster keep a local top-down layout.
+    Final coords = macro centroid + micro local coords.
+
+    Returns None when the graph is too small to benefit; caller falls back to
+    the standard smart top-down layout."""
+    # Gate to avoid unnecessary work on small graphs.
+    non_empty_files = {file_of.get(n, "") for n in all_nodes if file_of.get(n, "")}
+    if len(all_nodes) < _SL_L2_MIN_NODES or len(non_empty_files) < _SL_L2_MIN_FILES:
+        return None
+
+    # Cluster assignment: file path; no-file nodes become singleton pseudo-clusters
+    # so unrelated externals don't collapse into one giant cluster.
+    cluster_of: dict[str, str] = {}
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for n in sorted(all_nodes):
+        fp = file_of.get(n, "")
+        cid = fp if fp else f"__nofile__::{n}"
+        cluster_of[n] = cid
+        clusters[cid].append(n)
+
+    # Micro layout per cluster.
+    micro_pos: dict[str, dict[str, tuple[float, float]]] = {}
+    cluster_size: dict[str, tuple[float, float]] = {}
+    for cid, members in clusters.items():
+        local, _has_root, _scc = _sl_layout_component(
+            members,
+            successors,
+            name_of,
+            file_of,
+            line_of,
+            node_sizes,
+            max(180.0, layer_gap * 0.62),
+            max(120.0, node_gap * 0.55),
+            max(3, min(10, sweeps)),
+        )
+        if not local:
+            local = {members[0]: (0.0, 0.0)}
+
+        xs = [p[0] for p in local.values()]
+        ys = [p[1] for p in local.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        cx = (min_x + max_x) / 2.0
+        cy = (min_y + max_y) / 2.0
+        norm_local: dict[str, tuple[float, float]] = {}
+        for nid, (x, y) in local.items():
+            norm_local[nid] = (x - cx, y - cy)
+        micro_pos[cid] = norm_local
+
+        width = max_x - min_x
+        height = max_y - min_y
+        cluster_size[cid] = (
+            max(220.0, width + _SL_L2_CLUSTER_PAD_X),
+            max(160.0, height + _SL_L2_CLUSTER_PAD_Y),
+        )
+
+    # Macro cluster graph (aggregated inter-cluster edges).
+    cluster_nodes: set[str] = set(clusters.keys())
+    csucc: dict[str, set[str]] = defaultdict(set)
+    cpred: dict[str, set[str]] = defaultdict(set)
+    for u in all_nodes:
+        cu = cluster_of[u]
+        for v in successors.get(u, ()):  # noqa: SIM118
+            if v not in all_nodes:
+                continue
+            cv = cluster_of[v]
+            if cu == cv:
+                continue
+            csucc[cu].add(cv)
+            cpred[cv].add(cu)
+
+    cname_of = {cid: (cid.replace('\\', '/').split('/')[-1] if not cid.startswith('__nofile__::') else name_of.get(clusters[cid][0], cid))
+                for cid in cluster_nodes}
+    cfile_of = {cid: cid for cid in cluster_nodes}
+    cline_of = {cid: 0 for cid in cluster_nodes}
+
+    c_components = _sl_weak_components(cluster_nodes, csucc, cpred)
+    c_results: list[tuple[dict[str, tuple[float, float]], bool, list[str]]] = []
+    for comp_nodes in c_components:
+        local_c, has_root_c, _ = _sl_layout_component(
+            comp_nodes,
+            csucc,
+            cname_of,
+            cfile_of,
+            cline_of,
+            cluster_size,
+            layer_gap * _SL_L2_LAYER_GAP_SCALE,
+            node_gap * _SL_L2_NODE_GAP_SCALE,
+            max(3, min(12, sweeps)),
+        )
+        c_results.append((local_c, has_root_c, comp_nodes))
+
+    macro_pos = _sl_pack_components(c_results, csucc, cfile_of)
+    if not macro_pos:
+        return None
+
+    final: dict[str, tuple[float, float]] = {}
+    for cid, members in clusters.items():
+        mcx, mcy = macro_pos.get(cid, (0.0, 0.0))
+        local = micro_pos.get(cid, {})
+        for n in members:
+            lx, ly = local.get(n, (0.0, 0.0))
+            final[n] = (mcx + lx, mcy + ly)
+    return final
+
+
 def _compute_layout(
     graph: CallGraph,
     h_sep: int = 420,
@@ -1036,19 +1166,36 @@ def _compute_layout(
     node_gap = float(h_sep) * 0.6
     sweeps = _sl_sweeps_for(len(all_nodes))
 
-    components = _sl_weak_components(all_nodes, successors, predecessors)
+    final = _sl_layout_l2_clustered(
+        all_nodes, successors, predecessors,
+        name_of, file_of, line_of, node_sizes,
+        layer_gap, node_gap, sweeps,
+    )
 
-    comp_results: list[tuple[dict[str, tuple[float, float]], bool, list[str]]] = []
-    scc_total = 0
-    for comp_nodes in components:
-        local, has_root, scc_count = _sl_layout_component(
-            comp_nodes, successors, name_of, file_of, line_of, node_sizes,
-            layer_gap, node_gap, sweeps,
-        )
-        scc_total += scc_count
-        comp_results.append((local, has_root, comp_nodes))
+    if final is None:
+        components = _sl_weak_components(all_nodes, successors, predecessors)
 
-    final = _sl_pack_components(comp_results, successors, file_of)
+        comp_results: list[tuple[dict[str, tuple[float, float]], bool, list[str]]] = []
+        scc_total = 0
+        for comp_nodes in components:
+            local, has_root, scc_count = _sl_layout_component(
+                comp_nodes, successors, name_of, file_of, line_of, node_sizes,
+                layer_gap, node_gap, sweeps,
+            )
+            scc_total += scc_count
+            comp_results.append((local, has_root, comp_nodes))
+
+        final = _sl_pack_components(comp_results, successors, file_of)
+        diag_mode = 'smart-topdown'
+        diag_weak = len(components)
+        diag_largest = (max(len(c) for c in components) if components else 0)
+        diag_scc = scc_total
+    else:
+        diag_mode = 'l2-clustered'
+        components = _sl_weak_components(all_nodes, successors, predecessors)
+        diag_weak = len(components)
+        diag_largest = (max(len(c) for c in components) if components else 0)
+        diag_scc = -1
 
     # Center the whole canvas horizontally (matches prior behaviour).
     if final:
@@ -1059,10 +1206,11 @@ def _compute_layout(
             px, py = final[n]
             final[n] = (px - mid, py)
         _sl_diagnostics({
+            "mode": diag_mode,
             "nodes": len(all_nodes), "edges": edge_total,
-            "weak_components": len(components),
-            "largest_component": (max(len(c) for c in components) if components else 0),
-            "sccs": scc_total, "sweeps": sweeps,
+            "weak_components": diag_weak,
+            "largest_component": diag_largest,
+            "sccs": diag_scc, "sweeps": sweeps,
             "canvas_w": round(max(xs) - min(xs), 1),
             "canvas_h": round(max(ys) - min(ys), 1),
         })
@@ -1498,7 +1646,7 @@ body { display: flex !important; flex-direction: row !important; }
 .hp-lang-ext     { background:#2a2a2a; color:#BDC3C7; }
 .hp-ftype        { background:#2a2e38; color:#99aabb; }
 .hp-virtual      { background:#3a2e1a; color:#f0c674; }
-.hp-name  { font-size: 13px; font-weight: 700; color: #74B3F7; margin-bottom: 6px; word-break: break-all; }
+.hp-name  { font-size: 13px; font-weight: 700; color: #DCDCAA; margin-bottom: 6px; word-break: break-all; }
 .hp-doc   { font-style: italic; font-size: 11px; color: #8da0b0; margin-bottom: 6px; line-height: 1.35; }
 .hp-row   { display: flex; gap: 5px; margin-bottom: 2px; font-size: 11px; }
 .hp-lbl   { color: #6a7a8a; min-width: 70px; flex-shrink: 0; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; padding-top: 1px; }
@@ -1542,7 +1690,7 @@ body { display: flex !important; flex-direction: row !important; }
   background: none; border: none; padding: 2px 6px;
 }
 #cg-modal-close:hover { color: #e0e0e0; }
-.cg-modal-title { font-size: 16px; font-weight: 700; color: #74B3F7; margin-bottom: 3px; margin-right: 40px; word-break: break-all; }
+.cg-modal-title { font-size: 16px; font-weight: 700; color: #DCDCAA; margin-bottom: 3px; margin-right: 40px; word-break: break-all; }
 .cg-modal-qname { font-size: 11px; color: #8090a0; margin-bottom: 12px; font-family: monospace; word-break: break-all; }
 .cg-modal-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid #2d3139; }
 .cg-modal-section h3 { font-size: 10px; text-transform: uppercase; color: #6a7a8a; letter-spacing: 0.8px; margin-bottom: 8px; }
@@ -1551,8 +1699,48 @@ body { display: flex !important; flex-direction: row !important; }
 .cg-modal-val { color: #ddd; font-family: monospace; word-break: break-all; line-height: 1.5; }
 .cg-modal-param { background: #1a1d23; border-radius: 4px; padding: 5px 10px; margin-bottom: 4px; font-family: monospace; font-size: 11px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .cg-modal-param-num { color: #6a7a8a; min-width: 20px; }
-.cg-modal-param-name { color: #ddd; }
+.cg-modal-param-name { color: #4EC9B0; }
 .cg-modal-param-type { color: #74B3F7; }
+.cg-hl-fn { color: #DCDCAA; }
+.cg-hl-var { color: #4EC9B0; }
+.cg-hl-type { color: #7FB069; }
+.cg-hl-kw { color: #4A90D9; font-weight: 600; }
+.cg-hl-kw-union { color: #C77DD9; font-weight: 600; }
+.cg-hl-kw-enum { color: #E0A458; font-weight: 600; }
+.cg-hl-kw-qual { color: #B896DC; }
+.cg-hl-builtin { color: #74B3F7; }
+.cg-hl-punct { color: #8090a0; }
+/* ── Function-mode signature cards (scale-with-zoom overlay) ── */
+.cg-fnsig { position:absolute; transform:translate(-50%,-50%); pointer-events:none;
+  font-family:'JetBrains Mono','Cascadia Code','SF Mono',Consolas,'Segoe UI Mono',monospace;
+  background:#1b1f27; border:2px solid #4A90D9; border-left-width:5px; border-radius:7px;
+  box-shadow:0 4px 14px rgba(0,0,0,0.38); padding:5px 10px; white-space:nowrap; color:#c8d0da; line-height:1.4;
+  content-visibility:auto; contain-intrinsic-size:150px 42px; }
+.cg-fnsig-detail { font-size:12px; }
+.cg-fnsig-medium { font-size:12px; padding:4px 9px; }
+.cg-fnsig-sel { box-shadow:0 0 0 3px rgba(116,179,247,0.45),0 6px 18px rgba(0,0,0,0.45); }
+/* Language contour thickens as the graph zooms out so nodes never blend into
+   the background (the layer scales, so a larger base width keeps it visible). */
+#cg-fn-sig-layer[data-zo="1"] .cg-fnsig { border-width:3px; border-left-width:6px; }
+#cg-fn-sig-layer[data-zo="2"] .cg-fnsig { border-width:5px; border-left-width:8px; }
+#cg-fn-sig-layer[data-zo="3"] .cg-fnsig { border-width:9px; border-left-width:12px; }
+.cg-fnsig-parent { color:#8090a0; font-size:10px; }
+.cg-fnsig-foot { color:#6a7a8a; font-size:10px; margin-top:2px; }
+.cg-fnsig-badge { display:inline-block; font-size:9px; font-weight:700; padding:0 5px; border-radius:8px; margin-left:7px; vertical-align:middle; }
+.cg-fnsig-badge-root { background:#33280a; color:#ffd76a; }
+.cg-fnsig-badge-ext { background:#242a30; color:#9aa7b3; }
+.cg-fnsig-pill { position:absolute; transform:translate(-50%,-50%); pointer-events:none;
+  display:flex; align-items:center; gap:6px; background:#1b1f27; border:1px solid #2d3139;
+  border-radius:11px; padding:2px 9px 2px 7px; font-size:11px; color:#d2dae4;
+  box-shadow:0 2px 9px rgba(0,0,0,0.32); white-space:nowrap;
+  font-family:'JetBrains Mono','Cascadia Code','SF Mono',Consolas,'Segoe UI Mono',monospace; }
+.cg-fnsig-dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+#cg-fnmap { box-shadow:0 4px 16px rgba(0,0,0,0.45); border:1px solid #2d3139; }
+body[data-theme="light"] .cg-fnsig, body[data-theme="light"] .cg-fnsig-pill {
+  background:#ffffff; border-color:#c8d4de; color:#33414f; box-shadow:0 3px 12px rgba(0,0,0,0.14); }
+body[data-theme="light"] .cg-fnsig-sel { border-color:#1d4ed8; box-shadow:0 0 0 3px rgba(29,78,216,0.28),0 6px 18px rgba(0,0,0,0.18); }
+body[data-theme="light"] .cg-fnsig-foot, body[data-theme="light"] .cg-fnsig-parent { color:#7a8898; }
+body[data-theme="light"] #cg-fnmap { border-color:#c8d4de; }
 .cg-modal-var-group { margin: 8px 0 10px; }
 .cg-modal-var-head { color: #8090a0; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin: 8px 0 5px; }
 .cg-modal-var-scope { min-width: 78px; color: #6a7a8a; text-transform: uppercase; font-size: 9px; }
@@ -1627,7 +1815,7 @@ body > .card {
 .cg-fc-collapse-btn:hover { color: #c0c8d4; background: #2d3545; }
 .cg-file-card.sv-collapsed .cg-fn-list { display: none; }
 .cg-file-card.sv-collapsed .cg-fc-header { border-bottom: none; }
-.cg-fc-fname { font-size: 13px; font-weight: 700; color: #e0e0e0; white-space: nowrap; }
+.cg-fc-fname { font-size: 13px; font-weight: 700; color: #9CDCFE; white-space: nowrap; }
 .cg-fc-dir { font-size: 10px; color: #5a6a7a; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cg-fc-count { font-size: 10px; color: #8090a0; background: #1a1d23; border-radius: 10px; padding: 1px 7px; flex-shrink: 0; }
 .cg-fn-list { padding: 2px 0; }
@@ -1648,7 +1836,7 @@ body > .card {
   flex-shrink: 0; letter-spacing: 0.3px;
 }
 .cg-fn-nm { font-family: monospace; font-size: 12px; color: #e0e0e0; }
-.cg-fn-nm-main { font-weight: 700; color: #74B3F7; }
+.cg-fn-nm-main { font-weight: 700; color: #DCDCAA; }
 .cg-fn-sig { font-family: monospace; font-size: 11px; color: #8090a0; }
 .cg-fn-callees { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .cg-cb {
@@ -1789,12 +1977,12 @@ body > .card {
 .cg-vf-node-body { padding: 7px 10px 8px; }
 .cg-vf-var-row { display: flex; align-items: baseline; gap: 5px; margin-bottom: 5px; }
 .cg-vf-var-label { font-size: 9px; color: #4a5a6a; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; min-width: 30px; }
-.cg-vf-var-name { font-size: 13px; font-weight: 700; color: #d4d4d4; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cg-vf-var-name { font-size: 13px; font-weight: 700; color: #4EC9B0; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cg-vf-info-row { display: flex; align-items: baseline; gap: 5px; margin-top: 3px; }
 .cg-vf-info-label { font-size: 9px; color: #4a5a6a; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; min-width: 30px; }
 .cg-vf-info-val { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cg-vf-type-val  { color: #74B3F7; font-family: monospace; }
-.cg-vf-fn-val    { color: #9090a0; }
+.cg-vf-fn-val    { color: #DCDCAA; }
 .cg-vf-file-val  { color: #5a6a7a; font-size: 10px; }
 .cg-vf-snippet {
   font-size: 10px; color: #9cdcfe; background: #141720; padding: 5px 9px;
@@ -1814,6 +2002,12 @@ body > .card {
   white-space: pre-wrap; word-break: break-all; line-height: 1.4;
   border-left: 2px solid #3a4a6a; padding-left: 5px; margin-top: 1px;
 }
+.cg-vf-type-chip {
+  font-size: 10px; line-height: 1.2; border-radius: 10px; padding: 2px 7px;
+  border: 1px solid #4A90D9; background: #142233; color: #9CDCFE;
+  cursor: pointer; font-family: Consolas, monospace;
+}
+.cg-vf-type-chip:hover { background: #1c3048; border-color: #74B3F7; }
 /* edges — blue palette matching Function/Script mode */
 .cg-vf-edge       { stroke: #6c8ebf; stroke-width: 2;   fill: none; opacity: 0.85; }
 .cg-vf-edge-call  { /* inherits */ }
@@ -2298,7 +2492,7 @@ body[data-theme="light"] .cg-edge-args { background: #edf2f7; border-color: #c8d
 body[data-theme="light"] .cg-edge-arg { color: #1a2535; }
 body[data-theme="light"] .cg-edge-empty { color: #9eb4c8; }
 /* Hover popup internals */
-body[data-theme="light"] .hp-name { color: #1d4ed8; }
+body[data-theme="light"] .hp-name { color: #a16207; }
 body[data-theme="light"] .hp-doc { color: #4a6070; }
 body[data-theme="light"] .hp-lbl { color: #7a8898; }
 body[data-theme="light"] .hp-val { color: #1a2535; }
@@ -2326,7 +2520,7 @@ body[data-theme="light"] #cg-modal { background: rgba(0,0,0,0.42); }
 body[data-theme="light"] #cg-modal-card { background: #fff; border-color: #9eb4c8; box-shadow: 0 20px 60px rgba(0,0,0,0.25); color: #1a2535; }
 body[data-theme="light"] #cg-modal-close { color: #7a8898; }
 body[data-theme="light"] #cg-modal-close:hover { color: #1a2535; }
-body[data-theme="light"] .cg-modal-title { color: #1d4ed8; }
+body[data-theme="light"] .cg-modal-title { color: #a16207; }
 body[data-theme="light"] .cg-modal-qname { color: #7a8898; }
 body[data-theme="light"] .cg-modal-section { border-top-color: #c8d4de; }
 body[data-theme="light"] .cg-modal-section h3 { color: #7a8898; }
@@ -2334,8 +2528,17 @@ body[data-theme="light"] .cg-modal-lbl { color: #7a8898; }
 body[data-theme="light"] .cg-modal-val { color: #1a2535; }
 body[data-theme="light"] .cg-modal-param { background: #edf2f7; color: #1a2535; }
 body[data-theme="light"] .cg-modal-param-num { color: #7a8898; }
-body[data-theme="light"] .cg-modal-param-name { color: #1a2535; }
+body[data-theme="light"] .cg-modal-param-name { color: #0f766e; }
 body[data-theme="light"] .cg-modal-param-type { color: #1d4ed8; }
+body[data-theme="light"] .cg-hl-fn { color: #a16207; }
+body[data-theme="light"] .cg-hl-var { color: #0f766e; }
+body[data-theme="light"] .cg-hl-type { color: #15803d; }
+body[data-theme="light"] .cg-hl-kw { color: #1d4ed8; font-weight: 600; }
+body[data-theme="light"] .cg-hl-kw-union { color: #9333ea; font-weight: 600; }
+body[data-theme="light"] .cg-hl-kw-enum { color: #b45309; font-weight: 600; }
+body[data-theme="light"] .cg-hl-kw-qual { color: #7c3aed; }
+body[data-theme="light"] .cg-hl-builtin { color: #2563eb; }
+body[data-theme="light"] .cg-hl-punct { color: #64748b; }
 body[data-theme="light"] .cg-modal-ci { background: #edf2f7; border-color: #c8d4de; color: #2c4455; }
 body[data-theme="light"] .cg-modal-ci:hover { color: #1d4ed8; border-color: #3b82f6; background: #dbeafe; }
 body[data-theme="light"] .cg-modal-ci-nocursor:hover { color: #2c4455; border-color: #c8d4de; background: #edf2f7; }
@@ -2356,7 +2559,7 @@ body[data-theme="light"] .cg-fc-header { background: #edf2f7; border-bottom-colo
 body[data-theme="light"] .cg-fc-header:hover { background: #e2eaf2; }
 body[data-theme="light"] .cg-fc-collapse-btn { color: #8090a0; }
 body[data-theme="light"] .cg-fc-collapse-btn:hover { color: #2d3a4a; background: #d6e4f0; }
-body[data-theme="light"] .cg-fc-fname { color: #1a2535; }
+body[data-theme="light"] .cg-fc-fname { color: #0369a1; }
 body[data-theme="light"] .cg-fc-dir { color: #7a8898; }
 body[data-theme="light"] .cg-fc-count { background: #dde6f0; color: #4a6070; }
 body[data-theme="light"] .cg-fn-row { border-bottom-color: #e5edf4; }
@@ -2365,7 +2568,7 @@ body[data-theme="light"] .cg-fn-row.sv-selected { background: #dbeafe !important
 body[data-theme="light"] .cg-fn-row.sv-match { background: #dcfce7 !important; border-left-color: #22c55e; }
 body[data-theme="light"] .cg-fn-row.sv-edge-endpoint { background: #fef9c3 !important; border-left-color: #eab308; }
 body[data-theme="light"] .cg-fn-nm { color: #1a2535; }
-body[data-theme="light"] .cg-fn-nm-main { color: #1d4ed8; }
+body[data-theme="light"] .cg-fn-nm-main { color: #a16207; }
 body[data-theme="light"] .cg-fn-sig { color: #7a8898; }
 body[data-theme="light"] .cg-fn-meta { color: #9eb4c8; }
 body[data-theme="light"] .cg-cb-ext { background: #edf2f7; color: #7a8898; border-color: #c8d4de; }
@@ -2387,13 +2590,15 @@ body[data-theme="light"] .cg-vf-node:hover { border-color: #3b82f6 !important; b
 body[data-theme="light"] .cg-vf-node-header { background: #f4f7fa; border-bottom-color: #e5edf4; }
 body[data-theme="light"] .cg-vf-var-label,
 body[data-theme="light"] .cg-vf-info-label { color: #7a8898; }
-body[data-theme="light"] .cg-vf-var-name { color: #1a2535; }
-body[data-theme="light"] .cg-vf-fn-val { color: #7a8898; }
+body[data-theme="light"] .cg-vf-var-name { color: #0f766e; }
+body[data-theme="light"] .cg-vf-fn-val { color: #a16207; }
 body[data-theme="light"] .cg-vf-file-val { color: #9eb4c8; }
 body[data-theme="light"] .cg-vf-type-val { color: #1d4ed8; }
 body[data-theme="light"] .cg-vf-snippet { background: #edf2f7; border-top-color: #e5edf4; color: #1e6da0; }
 body[data-theme="light"] .cg-vf-doc-chip { background: #f1f8eb; border-top-color: #d4e8c2; color: #4a7a30; }
 body[data-theme="light"] .cg-vf-source-val { color: #1e6da0; border-left-color: #9ab0d0; }
+body[data-theme="light"] .cg-vf-type-chip { background: #eaf2fb; color: #1d4ed8; border-color: #9ab0d0; }
+body[data-theme="light"] .cg-vf-type-chip:hover { background: #dbeafe; border-color: #3b82f6; }
 body[data-theme="light"] .cg-vf-node.cg-vf-connect-input { background: #f8f0ff !important; }
 body[data-theme="light"] .cg-vf-node.cg-vf-custom-input { background: #f0fdfd !important; }
 body[data-theme="light"] #cg-vf-legend { background: rgba(255,255,255,0.96); border-color: #c8d4de; color: #1a2535; box-shadow: 0 4px 18px rgba(0,0,0,0.12); }
@@ -2578,6 +2783,8 @@ _SIDEBAR_HTML = """\
     <div class="cg-btn-row" id="cg-fn-layout-row">
       <button class="cg-btn" id="cg-btn-straight" title="Toggle straight vs curved edges">&#10231; Straight</button>
       <button class="cg-btn" id="cg-btn-hierarchical" title="Toggle layered top-down layout">&#8862; Layered</button>
+      <button class="cg-btn" id="cg-btn-fn-cluster" title="Cluster function nodes by source file (vis.js prototype)">&#128451; File clusters</button>
+      <button class="cg-btn active" id="cg-btn-minimap" title="Toggle overview minimap (semantic-zoom navigation)">&#128506; Minimap</button>
     </div>
     <div class="cg-btn-row" id="cg-sv-layout-row" style="display:none">
       <button class="cg-btn" id="cg-btn-sv-straight" title="Toggle straight vs curved edges">&#10231; Straight</button>
@@ -2966,6 +3173,8 @@ _SIDEBAR_JS = """
   var _fnHierarchical  = false;  /* default: precomputed file-clustered layout
                                     (callers above callees + same-file grouping).
                                     "Layered" button opts into vis.js hierarchical. */
+  var _fnClusterByFile = false;  /* LAY-3: vis.js native per-file clusters */
+  var _fnClusterIds = {};        /* cluster node id -> 1 */
   var _fnMarquee = null;
   var _fnMidPan  = null;   /* middle-mouse pan state for Function Nodes (vis.js) */
   var _fnGroupDrag = null;
@@ -3012,6 +3221,78 @@ _SIDEBAR_JS = """
       var n = window.network;
       return (n && n.body) ? n : null;
     } catch(e) { return null; }
+  }
+
+  var _fnNodeFileById = {};
+  NODE_DATA.forEach(function(n){ _fnNodeFileById[n.id] = (n.meta && n.meta.file_path) ? String(n.meta.file_path) : ''; });
+
+  function _fnFileBase(fp){ return String(fp || '').replace(/.*[\\/]/g, ''); }
+
+  function _fnOpenAllFileClusters(net){
+    net = net || getNet();
+    if (!net) return;
+    Object.keys(_fnClusterIds).forEach(function(cid){
+      try {
+        if (net.isCluster && net.isCluster(cid)) {
+          net.openCluster(cid, { releaseFunction: function(clusterPos, childPos){ return childPos; } });
+        }
+      } catch(e) {}
+      delete _fnClusterIds[cid];
+    });
+  }
+
+  function _fnApplyFileClusters(net){
+    net = net || getNet();
+    if (!net) return;
+    _fnOpenAllFileClusters(net);
+    if (!_fnClusterByFile) return;
+
+    var ids = [];
+    try { ids = net.body.data.nodes.getIds(); } catch(e) { return; }
+    var fileCounts = {};
+    ids.forEach(function(id){
+      id = String(id || '');
+      if (!id || id.indexOf('__var__') === 0 || id.indexOf('cg_file_cluster::') === 0) return;
+      var fp = _fnNodeFileById[id] || '';
+      if (!fp) return;
+      fileCounts[fp] = (fileCounts[fp] || 0) + 1;
+    });
+
+    var files = Object.keys(fileCounts).filter(function(fp){ return fileCounts[fp] >= 2; }).sort();
+    if (!files.length) return;
+
+    var isLight = (document.body && document.body.getAttribute('data-theme') === 'light');
+    var bg = isLight ? '#e8eff8' : '#1d2734';
+    var border = isLight ? '#7fa1c2' : '#4a6d92';
+    var font = isLight ? '#1f3b57' : '#c7d9ee';
+
+    files.forEach(function(fp){
+      var cid = 'cg_file_cluster::' + fp;
+      try {
+        net.cluster({
+          joinCondition: function(nodeOptions){
+            var id = String((nodeOptions && nodeOptions.id) || '');
+            if (!id || id.indexOf('__var__') === 0 || id.indexOf('cg_file_cluster::') === 0) return false;
+            return (_fnNodeFileById[id] || '') === fp;
+          },
+          clusterNodeProperties: {
+            id: cid,
+            shape: 'box',
+            borderWidth: 2,
+            label: _fnFileBase(fp) + ' (' + fileCounts[fp] + ')',
+            title: fp + ' - ' + fileCounts[fp] + ' functions',
+            color: {
+              background: bg,
+              border: border,
+              highlight: { background: bg, border: border },
+              hover: { background: bg, border: border }
+            },
+            font: { size: 12, face: 'monospace', color: font }
+          }
+        });
+        if (net.isCluster && net.isCluster(cid)) _fnClusterIds[cid] = 1;
+      } catch(e) {}
+    });
   }
 
   document.addEventListener('mousemove', function(e) { lastMX = e.clientX; lastMY = e.clientY; });
@@ -3064,6 +3345,71 @@ _SIDEBAR_JS = """
   /* ── Utility ──────────────────────────────────────────────── */
   function esc(s) {
     return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function _cgHiType(typeStr){
+    var s = String(typeStr == null ? '' : typeStr);
+    if (!s) return '';
+    var KW = {'struct':'cg-hl-kw','class':'cg-hl-kw','union':'cg-hl-kw-union','enum':'cg-hl-kw-enum','typedef':'cg-hl-kw'};
+    var QUAL = {'const':1,'volatile':1,'unsigned':1,'signed':1,'static':1,'extern':1,'register':1,'restrict':1,'inline':1,'mutable':1};
+    var BUILTIN = {'int':1,'char':1,'float':1,'double':1,'short':1,'long':1,'void':1,'bool':1,'wchar_t':1,'size_t':1,'ssize_t':1,'int8_t':1,'int16_t':1,'int32_t':1,'int64_t':1,'uint8_t':1,'uint16_t':1,'uint32_t':1,'uint64_t':1,'uintptr_t':1,'intptr_t':1,'ptrdiff_t':1};
+    var toks = s.match(/[A-Za-z_][A-Za-z0-9_]*|\\s+|[^A-Za-z0-9_\\s]+/g) || [];
+    var out = '';
+    toks.forEach(function(t){
+      if (/^\\s+$/.test(t)) { out += t; return; }
+      if (/^[A-Za-z_]/.test(t)) {
+        var lc = t.toLowerCase();
+        if (KW[lc]) out += '<span class="' + KW[lc] + '">' + esc(t) + '</span>';
+        else if (QUAL[lc]) out += '<span class="cg-hl-kw-qual">' + esc(t) + '</span>';
+        else if (BUILTIN[lc]) out += '<span class="cg-hl-builtin">' + esc(t) + '</span>';
+        else out += '<span class="cg-hl-type">' + esc(t) + '</span>';
+      } else {
+        out += '<span class="cg-hl-punct">' + esc(t) + '</span>';
+      }
+    });
+    return out;
+  }
+  function _vfHiSourceText(text, occ) {
+    var s = String(text == null ? '' : text);
+    if (!s) return '';
+    var fnName = occ && occ.function_name ? String(occ.function_name) : '';
+    var nameMap = {};
+    function addName(v) {
+      if (!v) return;
+      var k = String(v);
+      if (k) nameMap[k] = true;
+    }
+    addName(occ && occ.name);
+    addName(occ && occ._localName);
+    addName(occ && occ._origName);
+    addName(occ && occ.connect_input_name);
+    var typeWords = {};
+    var typeText = occ && (occ.data_type || occ.type_hint || '');
+    if (typeText) {
+      var typeToks = String(typeText).match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+      typeToks.forEach(function(t){
+        var lc = t.toLowerCase();
+        if (lc === 'struct' || lc === 'class' || lc === 'typedef') typeWords[t] = 'cg-hl-kw';
+        else if (lc === 'union') typeWords[t] = 'cg-hl-kw-union';
+        else if (lc === 'enum') typeWords[t] = 'cg-hl-kw-enum';
+        else if (lc === 'const' || lc === 'volatile' || lc === 'unsigned' || lc === 'signed' || lc === 'static' || lc === 'extern' || lc === 'register' || lc === 'restrict' || lc === 'inline' || lc === 'mutable') typeWords[t] = 'cg-hl-kw-qual';
+        else if (lc === 'int' || lc === 'char' || lc === 'float' || lc === 'double' || lc === 'short' || lc === 'long' || lc === 'void' || lc === 'bool' || lc === 'wchar_t' || lc === 'size_t' || lc === 'ssize_t' || lc === 'int8_t' || lc === 'int16_t' || lc === 'int32_t' || lc === 'int64_t' || lc === 'uint8_t' || lc === 'uint16_t' || lc === 'uint32_t' || lc === 'uint64_t' || lc === 'uintptr_t' || lc === 'intptr_t' || lc === 'ptrdiff_t') typeWords[t] = 'cg-hl-builtin';
+        else typeWords[t] = 'cg-hl-type';
+      });
+    }
+    var toks = s.match(/[A-Za-z_][A-Za-z0-9_]*|\\s+|[^A-Za-z0-9_\\s]+/g) || [];
+    var out = '';
+    toks.forEach(function(t){
+      if (/^\\s+$/.test(t)) { out += t; return; }
+      if (/^[A-Za-z_]/.test(t)) {
+        if (fnName && t === fnName) out += '<span class="cg-hl-fn">' + esc(t) + '</span>';
+        else if (nameMap[t]) out += '<span class="cg-hl-var">' + esc(t) + '</span>';
+        else if (typeWords[t]) out += '<span class="' + typeWords[t] + '">' + esc(t) + '</span>';
+        else out += esc(t);
+      } else {
+        out += '<span class="cg-hl-punct">' + esc(t) + '</span>';
+      }
+    });
+    return out;
   }
   function _hpRow(label, val) {
     return '<div class="hp-row"><span class="hp-lbl">' + label + '</span><span class="hp-val">' + val + '</span></div>';
@@ -3478,7 +3824,7 @@ _SIDEBAR_JS = """
       args.forEach(function(arg, i) {
         var argType = _edgeArgType(edge, arg, i);
         h += '<div class="cg-edge-arg"><span>' + (i + 1) + '. ' + esc(arg) + '</span>';
-        h += '<span class="cg-edge-arg-type">type: ' + esc(argType) + '</span></div>';
+        h += '<span class="cg-edge-arg-type">type: ' + _cgHiType(argType) + '</span></div>';
       });
     } else {
       h += '<div class="cg-edge-empty">none detected</div>';
@@ -3590,6 +3936,7 @@ _SIDEBAR_JS = """
     if (currentMode === 'varflow') { _vfSidebarSearch(q); return; }
     if (currentMode === 'module' && window.cgxModuleSearch) { window.cgxModuleSearch(q); return; }
     if (currentMode === 'inc' && window.cgxIncSearch) { window.cgxIncSearch(q); return; }
+    if (currentMode === 'types' && window.cgxTypeSearch) { window.cgxTypeSearch(q); return; }
     var inp = document.getElementById('cg-search');
     var dd  = document.getElementById('cg-search-dropdown');
     if (!inp || !dd) return;
@@ -3658,6 +4005,7 @@ _SIDEBAR_JS = """
     });
     searchInput.addEventListener('input', function() {
       _showSearchDropdown(searchInput.value);
+      if (currentMode === 'types') return;
       updateHint(findNodes(searchInput.value));
     });
     searchInput.addEventListener('blur', function() {
@@ -3675,6 +4023,7 @@ _SIDEBAR_JS = """
       if (e.key === 'Enter') {
         var dd2 = document.getElementById('cg-search-dropdown');
         if (dd2) dd2.style.display = 'none';
+        if (currentMode === 'types' && window.cgxTypeSearchEnter) { window.cgxTypeSearchEnter(searchInput.value); return; }
         var matches = findNodes(searchInput.value);
         updateHint(matches);
         if (!matches.length) return;
@@ -3732,6 +4081,12 @@ _SIDEBAR_JS = """
       _flashBtn(btnHighlight, _vfCurrentNodes.length + ' blocks', 1200);
       return;
     }
+    if (currentMode === 'types' && window.cgxTypeHighlight) {
+      var thq = searchInput ? searchInput.value.trim() : '';
+      var thCount = window.cgxTypeHighlight(thq ? [thq] : []);
+      _flashBtn(btnHighlight, thCount ? thCount + ' found' : 'No match', 1200);
+      return;
+    }
     var targets = _getTargetNodes();
     updateHint(findNodes(searchInput ? searchInput.value : ''));
     if (!targets.length) { _flashBtn(btnHighlight, 'No match', 900); return; }
@@ -3764,6 +4119,11 @@ _SIDEBAR_JS = """
       _vfCenterOnFirst();
       return;
     }
+    if (currentMode === 'types' && window.cgxTypeCenter) {
+      var tcq = searchInput ? searchInput.value.trim() : '';
+      if (!tcq || !window.cgxTypeCenter(tcq)) _flashBtn(btnCenter, 'No match', 900);
+      return;
+    }
     var target = _getFirstTarget();
     if (!target) { _flashBtn(btnCenter, 'No match', 900); return; }
     if (currentMode === 'script') { _svScrollTo(target); return; }
@@ -3782,6 +4142,13 @@ _SIDEBAR_JS = """
       if (vk !== _vfCurrentVar) _vfSelectVar(vk);
       _vfHighlightBlocks(vk);
       _flashBtn(btnIsolate, _vfCurrentNodes.length + ' blocks', 1400);
+      return;
+    }
+    if (currentMode === 'types' && window.cgxTypeIsolate) {
+      var tq = searchInput ? searchInput.value.trim() : '';
+      if (!tq) { _flashBtn(btnIsolate, 'No match', 900); return; }
+      var tCount = window.cgxTypeIsolate(tq, _getDepth(), _getDir());
+      _flashBtn(btnIsolate, tCount ? tCount + ' visible' : 'No match', 1400);
       return;
     }
     var target = _getFirstTarget();
@@ -3824,6 +4191,13 @@ _SIDEBAR_JS = """
         if (inp2) inp2.value=VAR_FLOW_DATA[vk][0].name;
       }
       _flashBtn(btnExpand, _vfCurrentNodes.length + ' blocks', 1400);
+      return;
+    }
+    if (currentMode === 'types' && window.cgxTypeExpand) {
+      var teq = searchInput ? searchInput.value.trim() : '';
+      if (!teq) { _flashBtn(btnExpand, 'No match', 900); return; }
+      var teCount = window.cgxTypeExpand(teq, _getDepth(), _getDir());
+      _flashBtn(btnExpand, teCount ? teCount + ' shown' : 'No match', 1400);
       return;
     }
     var target = _getFirstTarget();
@@ -3882,6 +4256,7 @@ _SIDEBAR_JS = """
     if (currentMode === 'script') { _svClearHighlight(); updateHint([]); return; }
     if (currentMode === 'module' && window.cgxModuleClearFocus) { window.cgxModuleClearFocus(); updateHint([]); return; }
     if (currentMode === 'inc' && window.cgxIncClearFocus) { window.cgxIncClearFocus(); updateHint([]); return; }
+    if (currentMode === 'types' && window.cgxTypeClearFocus) { window.cgxTypeClearFocus(); updateHint([]); return; }
     _showAllNodes();
     updateHint([]);
   });
@@ -3891,6 +4266,7 @@ _SIDEBAR_JS = """
     if (currentMode === 'script') { _svFitView(); return; }
     if (currentMode === 'module' && window.cgxModuleFit) { window.cgxModuleFit(); return; }
     if (currentMode === 'inc' && window.cgxIncFit) { window.cgxIncFit(); return; }
+    if (currentMode === 'types' && window.cgxTypeFit) { window.cgxTypeFit(); return; }
     var net = getNet(); if (!net) return;
     net.fit({ animation: { duration: 500 } });
   });
@@ -3902,6 +4278,7 @@ _SIDEBAR_JS = """
     if (currentMode === 'script') { _svClearHighlight(); updateHint([]); return; }
     if (currentMode === 'module' && window.cgxModuleClearFocus) { window.cgxModuleClearFocus(); updateHint([]); return; }
     if (currentMode === 'inc' && window.cgxIncClearFocus) { window.cgxIncClearFocus(); updateHint([]); return; }
+    if (currentMode === 'types' && window.cgxTypeShowAll) { window.cgxTypeShowAll(); updateHint([]); return; }
     _showAllNodes();
     updateHint([]);
   });
@@ -3927,6 +4304,11 @@ _SIDEBAR_JS = """
       _flashBtn(btnSaveLayout, 'Saved!', 1200);
       return;
     }
+    if (currentMode === 'types' && window.cgxTypeSaveLayout) {
+      window.cgxTypeSaveLayout();
+      _flashBtn(btnSaveLayout, 'Saved!', 1200);
+      return;
+    }
     /* fn-mode: save sparse diff against INITIAL_POS (saves only moved nodes) */
     var net = getNet(); if (!net) return;
     _fnSaveLayout(net);
@@ -3942,6 +4324,10 @@ _SIDEBAR_JS = """
     }
     if (currentMode === 'module' && window.cgxModuleResetLayout) {
       window.cgxModuleResetLayout();
+      _flashBtn(btnResetLayout, 'Reset!', 1200); return;
+    }
+    if (currentMode === 'types' && window.cgxTypeResetLayout) {
+      window.cgxTypeResetLayout();
       _flashBtn(btnResetLayout, 'Reset!', 1200); return;
     }
     var net = getNet(); if (!net) return;
@@ -3968,6 +4354,11 @@ _SIDEBAR_JS = """
     }
     if (currentMode === 'module' && window.cgxModuleClearSaved) {
       window.cgxModuleClearSaved();
+      _flashBtn(btnClearSaved, 'Cleared!', 1600);
+      return;
+    }
+    if (currentMode === 'types' && window.cgxTypeClearSaved) {
+      window.cgxTypeClearSaved();
       _flashBtn(btnClearSaved, 'Cleared!', 1600);
       return;
     }
@@ -4015,14 +4406,14 @@ _SIDEBAR_JS = """
     }
 
     if (meta.return_type)
-      h += _hpRow('Returns', '<span class="hp-val" style="color:#74B3F7">' + esc(meta.return_type) + '</span>');
+      h += _hpRow('Returns', '<span class="hp-val">' + _cgHiType(meta.return_type) + '</span>');
 
     if (meta.parameters && meta.parameters.length) {
       h += '<div class="hp-divider"></div>';
       h += '<div class="hp-section-hdr">Parameters (' + meta.parameters.length + ')</div>';
       meta.parameters.forEach(function(p, i) {
-        var pstr = esc(p.name);
-        if (p.type_hint) pstr += ' <span style="color:#aaa">: ' + esc(p.type_hint) + '</span>';
+        var pstr = '<span class="cg-hl-var">' + esc(p.name) + '</span>';
+        if (p.type_hint) pstr += ' : ' + _cgHiType(p.type_hint);
         h += '<div class="hp-row"><span class="hp-lbl">arg ' + (i+1) + '</span><span class="hp-val">' + pstr + '</span></div>';
       });
     }
@@ -4178,7 +4569,7 @@ _SIDEBAR_JS = """
     /* ── Signature ── */
     h += '<div class="cg-modal-section"><h3>Signature</h3>';
     if (m.return_type) {
-      h += '<div class="cg-modal-row"><span class="cg-modal-lbl">Return type</span><span class="cg-modal-val" style="color:#74B3F7">' + esc(m.return_type) + '</span></div>';
+      h += '<div class="cg-modal-row"><span class="cg-modal-lbl">Return type</span><span class="cg-modal-val">' + _cgHiType(m.return_type) + '</span></div>';
     } else {
       h += '<div class="cg-modal-row"><span class="cg-modal-lbl">Return type</span><span class="cg-modal-val" style="color:#5a6a7a">not specified</span></div>';
     }
@@ -4188,7 +4579,7 @@ _SIDEBAR_JS = """
         h += '<div class="cg-modal-param">';
         h += '<span class="cg-modal-param-num">' + (i+1) + '.</span>';
         h += '<span class="cg-modal-param-name">' + esc(p.name) + '</span>';
-        if (p.type_hint) h += '<span class="cg-modal-param-type">: ' + esc(p.type_hint) + '</span>';
+        if (p.type_hint) h += '<span class="cg-modal-param-type">: ' + _cgHiType(p.type_hint) + '</span>';
         h += '</div>';
       });
     } else {
@@ -4223,7 +4614,7 @@ _SIDEBAR_JS = """
       h += '<div class="cg-modal-param">';
       h += '<span class="cg-modal-var-scope">' + esc(kindLabel) + '</span>';
       h += '<span class="cg-modal-param-name">' + esc(v.name || '?') + '</span>';
-      h += '<span class="cg-modal-param-type">type: ' + esc(v.type_hint || 'unknown') + '</span>';
+      h += '<span class="cg-modal-param-type">type: ' + _cgHiType(v.type_hint || 'unknown') + '</span>';
       if (v.source_kind) {
         h += '<span class="cg-modal-var-source">source: ' + esc(v.source_kind);
         if (v.source_detail) h += ' (' + esc(v.source_detail) + ')';
@@ -4372,8 +4763,10 @@ _SIDEBAR_JS = """
       return;
     }
 
+    var _fnFontColor = (document.body && document.body.getAttribute('data-theme') === 'light') ? '#a16207' : '#DCDCAA';
     net.setOptions({
-      interaction: { dragNodes:true, dragView:true, zoomView:true, hover:true, tooltipDelay:9999, multiselect:true }
+      interaction: { dragNodes:true, dragView:true, zoomView:true, hover:true, tooltipDelay:9999, multiselect:true },
+      nodes: { font: { color: _fnFontColor } }
     });
 
     /* Fn-mode marquee selection (desktop-style drag on background). */
@@ -4455,6 +4848,8 @@ _SIDEBAR_JS = """
         try { net.moveNode(id, savedDelta0[id].x, savedDelta0[id].y); } catch(e) {}
       });
     }
+
+    if (_fnClusterByFile) _fnApplyFileClusters(net);
 
     /* Default function view = precomputed file-clustered layout (INITIAL_POS +
        saved delta already applied above). The "Layered" button opts into vis.js
@@ -4544,7 +4939,12 @@ _SIDEBAR_JS = """
     /* Double-click: open full detail modal */
     net.on('doubleClick', function(p) {
       if (p.nodes && p.nodes.length > 0) {
-        openModal(p.nodes[0]);
+        var nid = p.nodes[0];
+        if (_fnClusterByFile && net.isCluster && net.isCluster(nid)) {
+          try { net.openCluster(nid); delete _fnClusterIds[nid]; } catch(e) {}
+          return;
+        }
+        openModal(nid);
       }
     });
 
@@ -4559,7 +4959,13 @@ _SIDEBAR_JS = """
         try {
           var rect = netEl.getBoundingClientRect();
           var nodeId = curNet.getNodeAt({x: ev.clientX - rect.left, y: ev.clientY - rect.top});
-          if (nodeId) openModal(nodeId);
+          if (nodeId) {
+            if (_fnClusterByFile && curNet.isCluster && curNet.isCluster(nodeId)) {
+              try { curNet.openCluster(nodeId); delete _fnClusterIds[nodeId]; } catch(e) {}
+              return;
+            }
+            openModal(nodeId);
+          }
         } catch(e) {}
       });
     }
@@ -4592,7 +4998,7 @@ _SIDEBAR_JS = """
     });
     _fnEnsureTraceControl();
   }
-  /* ── Large-graph warning + level-of-detail ─────────────────── */
+  /* ── Large-graph warning ───────────────────────────────────── */
   (function() {
     if (!LARGE_GRAPH) return;
     var warn = document.getElementById('cg-large-graph-warn');
@@ -4601,35 +5007,228 @@ _SIDEBAR_JS = """
       warn.innerHTML = '<b>&#9888; Large graph (' + NODE_DATA.length + ' nodes)</b><br>'
         + 'Function Nodes mode uses vis.js canvas — smooth above ~2k nodes may be limited. '
         + 'Edges are straight for performance. '
-        + 'Labels auto-hide when zoomed out. '
+        + 'Node labels stay readable at every zoom level (semantic zoom). '
         + 'Script Nodes and Var Flow modes are unaffected.';
     }
-    /* Level-of-detail: hide fn-mode labels when scale < LOD threshold */
-    var _lodLabelsShown = true;
-    var _lodTimer = null;
-    var LOD_HIDE = 0.25, LOD_SHOW = 0.30;
-    function _checkLod() {
-      var net = getNet();
-      if (!net || currentMode !== 'fn') return;
-      try {
-        var sc = net.getScale();
-        var want = sc >= LOD_SHOW;
-        if (want !== _lodLabelsShown) {
-          _lodLabelsShown = want;
-          net.setOptions({ nodes: { font: { size: want ? 11 : 0 } } });
-        }
-      } catch(e) {}
+  })();
+
+  /* ── Function-mode signature cards + minimap ──
+     Each function node is drawn ONCE as a syntax-highlighted source-signature
+     card (reusing the .cg-hl-* palette from Script/VarFlow/Types modes). The
+     cards live in a single transformed layer that mirrors the vis.js viewport,
+     so they scale and pan with zoom exactly like the original nodes — zoom-in
+     enlarges, zoom-out shrinks. The underlying vis.js box is made invisible so
+     there is only ONE node on screen. A minimap gives spatial context. The
+     layer is pointer-events:none, so vis.js keeps hover / click / drag /
+     selection. */
+  (function() {
+    var FN_CARD_MAX = 4000;   /* above this, keep plain vis.js boxes (perf) */
+    var LANGCOL = {'python':'#4A90D9','c':'#E8832A','c++':'#27AE60','cpp':'#27AE60','matlab':'#8E44AD'};
+    var _layer=null, _cards={}, _pos=null, _posT=0, _hid=false, _wired=false, _built=false;
+    var _disabled=(NODE_DATA.length>FN_CARD_MAX);
+    var _sel={};
+    var _map=null, _mapCtx=null, _mapVisible=(NODE_DATA.length>150), _mapT=0, _bbox=null;
+    var _byId={}; NODE_DATA.forEach(function(n){ _byId[n.id]=n.meta; });
+
+    function _isFn(id){ return String(id).indexOf('__var__')!==0; }
+    function _meta(id){ return _byId[id] || null; }
+    function _langColor(meta){
+      if (!meta || meta.is_external) return '#95A5A6';
+      return LANGCOL[String(meta.language||'').toLowerCase()] || '#95A5A6';
     }
-    /* Wire LOD check to zoom events once vis.js is ready */
-    var _lodWireTimer = setInterval(function() {
-      var net = getNet();
-      if (!net) return;
-      clearInterval(_lodWireTimer);
-      net.on('zoom', function() {
-        clearTimeout(_lodTimer);
-        _lodTimer = setTimeout(_checkLod, 80);
-      });
-    }, 300);
+
+    function _refreshPos(){
+      var net=getNet(); if(!net) return;
+      try { _pos=net.getPositions(); } catch(e) { _pos=null; }
+      _posT=Date.now();
+      _computeBBox();
+    }
+    function _computeBBox(){
+      if(!_pos){ _bbox=null; return; }
+      var minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9,any=false;
+      for(var id in _pos){ if(!_isFn(id)) continue; var p=_pos[id];
+        if(p.x<minx)minx=p.x; if(p.y<miny)miny=p.y; if(p.x>maxx)maxx=p.x; if(p.y>maxy)maxy=p.y; any=true; }
+      _bbox = any ? {minx:minx,miny:miny,maxx:maxx,maxy:maxy} : null;
+    }
+    /* Make the vis.js function boxes invisible so only the card shows. */
+    function _hideBoxes(){
+      if(_hid) return;
+      var net=getNet(); if(!net||!net.body) return;
+      try {
+        var TR='rgba(0,0,0,0)';
+        var ids=net.body.data.nodes.getIds(), upd=[];
+        ids.forEach(function(id){
+          if(!_isFn(id)) return;
+          upd.push({id:id, borderWidth:0, shadow:{enabled:false}, font:{color:TR},
+            color:{background:TR, border:TR,
+                   highlight:{background:TR, border:TR}, hover:{background:TR, border:TR}}});
+        });
+        if(upd.length) net.body.data.nodes.update(upd);
+        _hid=true;
+      } catch(e){}
+    }
+    function _badge(meta){
+      if(meta && meta.root_rank) return '<span class="cg-fnsig-badge cg-fnsig-badge-root">Root #'+meta.root_rank+'</span>';
+      if(meta && meta.is_external) return '<span class="cg-fnsig-badge cg-fnsig-badge-ext">external</span>';
+      return '';
+    }
+    function _buildCard(el, meta){
+      el.className='cg-fnsig cg-fnsig-detail';
+      el.style.borderColor=_langColor(meta);
+      var h='';
+      if(meta.parent && meta.parent!=='<external>')
+        h += '<span class="cg-fnsig-parent">'+esc(meta.parent)+'::</span>';
+      var head='';
+      if(meta.return_type) head += _cgHiType(meta.return_type)+' ';
+      head += '<span class="cg-hl-fn" style="font-weight:700">'+esc(meta.name||'')+'</span>';
+      head += '<span class="cg-hl-punct">(</span>';
+      if(meta.parameters && meta.parameters.length){
+        head += meta.parameters.map(function(p){
+          var s=''; if(p.type_hint) s += _cgHiType(p.type_hint)+' ';
+          s += '<span class="cg-hl-var">'+esc(p.name||'')+'</span>'; return s;
+        }).join('<span class="cg-hl-punct">, </span>');
+      }
+      head += '<span class="cg-hl-punct">)</span>';
+      h += '<div>'+head+_badge(meta)+'</div>';
+      if(meta.file_path && meta.file_path!=='<external>'){
+        var fn2=String(meta.file_path).replace(/.*[\\\\/]/,'');
+        h += '<div class="cg-fnsig-foot">'+esc(fn2)+(meta.line_start?(':'+meta.line_start):'')+'</div>';
+      }
+      el.innerHTML=h;
+    }
+    function _ensureLayer(){
+      if(_layer) return _layer;
+      var netEl=document.getElementById('mynetwork');
+      var wr=(netEl&&netEl.parentElement&&netEl.parentElement!==document.body)?netEl.parentElement:netEl;
+      if(!wr) return null;
+      wr.style.position='relative';
+      _layer=document.createElement('div');
+      _layer.id='cg-fn-sig-layer';
+      _layer.style.cssText='position:absolute;top:0;left:0;pointer-events:none;z-index:6;transform-origin:0 0';
+      wr.appendChild(_layer);
+      _ensureMap(wr);
+      return _layer;
+    }
+    /* Create every card once, positioned in graph coords (static). */
+    function _buildAll(){
+      if(_built || _disabled || !_layer || !_pos) return;
+      var frag=document.createDocumentFragment();
+      for(var i=0;i<NODE_DATA.length;i++){
+        var id=NODE_DATA[i].id, meta=NODE_DATA[i].meta;
+        var p=_pos[id]; if(!meta || !p) continue;
+        var el=document.createElement('div');
+        _buildCard(el, meta);
+        el.style.left=p.x+'px'; el.style.top=p.y+'px';
+        _cards[id]=el; frag.appendChild(el);
+      }
+      _layer.appendChild(frag);
+      _built=true;
+    }
+    /* Re-sync card graph positions (after drag / layout change). */
+    function _repositionAll(){
+      if(!_pos) return;
+      for(var id in _cards){ var p=_pos[id]; if(p){ _cards[id].style.left=p.x+'px'; _cards[id].style.top=p.y+'px'; } }
+    }
+    function _applySel(nodes){
+      var next={};
+      (nodes||[]).forEach(function(id){ next[id]=1; });
+      for(var id in _sel){ if(!next[id] && _cards[id]) _cards[id].classList.remove('cg-fnsig-sel'); }
+      for(var id2 in next){ if(_cards[id2]) _cards[id2].classList.add('cg-fnsig-sel'); }
+      _sel=next;
+    }
+    function _update(){
+      var net=getNet(); if(!net) return;
+      if(currentMode!=='fn'){ if(_layer)_layer.style.display='none'; if(_map)_map.style.display='none'; return; }
+      if(!_ensureLayer()) return;
+      _layer.style.display='';
+      if(_map) _map.style.display=_mapVisible?'':'none';
+      if(!_disabled){
+        _hideBoxes();
+        if(!_pos) _refreshPos();
+        _buildAll();
+      }
+      var cont=document.getElementById('mynetwork'); if(!cont) return;
+      var scale, vp;
+      try { scale=net.getScale(); vp=net.getViewPosition(); } catch(e){ return; }
+      var W=cont.offsetWidth, H=cont.offsetHeight, cx=W/2, cy=H/2;
+      /* Mirror the vis.js viewport transform so cards scale + pan with zoom. */
+      _layer.style.transform='translate('+(cx-vp.x*scale)+'px,'+(cy-vp.y*scale)+'px) scale('+scale+')';
+      /* Thicken the language contour as we zoom out so nodes stay visible. */
+      var zo = scale>=0.55 ? '0' : (scale>=0.38 ? '1' : (scale>=0.24 ? '2' : '3'));
+      if(_layer.dataset.zo!==zo) _layer.dataset.zo=zo;
+      var now=Date.now();
+      if(!_disabled && (now-_posT)>600){ _refreshPos(); _repositionAll(); }
+      _drawMap(scale, vp, W, H);
+    }
+
+    /* ── Minimap ── */
+    function _ensureMap(wr){
+      if(_map) return;
+      _map=document.createElement('canvas');
+      _map.id='cg-fnmap'; _map.width=180; _map.height=130;
+      _map.style.cssText='position:absolute;right:12px;bottom:12px;z-index:15;border-radius:6px;cursor:pointer';
+      if(!_mapVisible) _map.style.display='none';
+      wr.appendChild(_map);
+      try { _mapCtx=_map.getContext('2d'); } catch(e) { _mapCtx=null; }
+      _map.addEventListener('mousedown', _mapNav);
+      _map.addEventListener('mousemove', function(e){ if(e.buttons&1) _mapNav(e); });
+    }
+    function _mapNav(e){
+      if(!_bbox) return; var net=getNet(); if(!net) return;
+      var r=_map.getBoundingClientRect();
+      var gw=(_bbox.maxx-_bbox.minx)||1, gh=(_bbox.maxy-_bbox.miny)||1;
+      var pad=6, s=Math.min((_map.width-2*pad)/gw,(_map.height-2*pad)/gh);
+      var ox=(_map.width-gw*s)/2, oy=(_map.height-gh*s)/2;
+      var gx=_bbox.minx+((e.clientX-r.left)-ox)/s;
+      var gy=_bbox.miny+((e.clientY-r.top)-oy)/s;
+      try { net.moveTo({position:{x:gx,y:gy}, animation:false}); } catch(e2){}
+    }
+    function _drawMap(scale, vp, W, H){
+      if(!_map || !_mapVisible || !_mapCtx || !_pos){ if(!_bbox && !_disabled) { if(!_pos)_refreshPos(); } return; }
+      if(!_bbox) return;
+      var now=Date.now(); if(now-_mapT<60) return; _mapT=now;
+      var mw=_map.width, mh=_map.height, pad=6;
+      var gw=(_bbox.maxx-_bbox.minx)||1, gh=(_bbox.maxy-_bbox.miny)||1;
+      var s=Math.min((mw-2*pad)/gw,(mh-2*pad)/gh);
+      var ox=(mw-gw*s)/2, oy=(mh-gh*s)/2;
+      var light=document.body.getAttribute('data-theme')==='light';
+      _mapCtx.clearRect(0,0,mw,mh);
+      _mapCtx.fillStyle=light?'rgba(255,255,255,0.92)':'rgba(20,24,31,0.90)';
+      _mapCtx.fillRect(0,0,mw,mh);
+      _mapCtx.strokeStyle=light?'#c8d4de':'#2d3139'; _mapCtx.strokeRect(0.5,0.5,mw-1,mh-1);
+      for(var id in _pos){ if(!_isFn(id)) continue; var p=_pos[id];
+        _mapCtx.fillStyle=_langColor(_meta(id));
+        _mapCtx.fillRect(ox+(p.x-_bbox.minx)*s-1, oy+(p.y-_bbox.miny)*s-1, 2, 2);
+      }
+      var hx=(W/2)/scale, hy=(H/2)/scale;
+      _mapCtx.strokeStyle=light?'#1d4ed8':'#74B3F7'; _mapCtx.lineWidth=1;
+      _mapCtx.strokeRect(ox+((vp.x-hx)-_bbox.minx)*s, oy+((vp.y-hy)-_bbox.miny)*s, (2*hx)*s, (2*hy)*s);
+    }
+    function _toggleMap(){
+      _mapVisible=!_mapVisible;
+      if(_map) _map.style.display=_mapVisible?'':'none';
+      var mb=document.getElementById('cg-btn-minimap');
+      if(mb) mb.classList.toggle('active', _mapVisible);
+      if(_mapVisible) _update();
+    }
+
+    function _wire(){
+      if(_wired) return; var net=getNet(); if(!net) return; _wired=true;
+      _refreshPos();
+      net.on('afterDrawing', _update);
+      net.on('zoom', _update);
+      net.on('dragEnd', function(){ _refreshPos(); _repositionAll(); _update(); });
+      net.on('selectNode', function(p){ _applySel(p.nodes); });
+      net.on('deselectNode', function(){ _applySel([]); });
+      net.on('dragStart', function(){ try { _applySel(net.getSelectedNodes()||[]); } catch(e){} });
+      var mb=document.getElementById('cg-btn-minimap');
+      if(mb){ mb.classList.toggle('active', _mapVisible); mb.addEventListener('click', _toggleMap); }
+      var fb=document.getElementById('cg-btn-mode-fn');
+      if(fb) fb.addEventListener('click', function(){ setTimeout(_update, 90); });
+      _update();
+      setTimeout(_update, 40);
+    }
+    var _t=setInterval(function(){ if(getNet()){ clearInterval(_t); _wire(); } }, 60);
   })();
 
   /* ── CSS escape polyfill ───────────────────────────────────── */
@@ -4715,7 +5314,10 @@ _SIDEBAR_JS = """
       if (searchInput) searchInput.placeholder = 'Function name...';
       if (searchHint) searchHint.textContent = 'Click to browse • type to filter';
       var net = getNet();
-      if (net) try { net.fit({ animation: false }); } catch(e) {}
+      if (net) {
+        try { if (_fnClusterByFile) _fnApplyFileClusters(net); } catch(e) {}
+        try { net.fit({ animation: false }); } catch(e) {}
+      }
       /* Inject Fn-mode annotation layer on first show */
       setTimeout(_fnInitAnnotLayer, 80);
     }
@@ -4732,6 +5334,19 @@ _SIDEBAR_JS = """
    * a no-op and Script / VarFlow / Function modes show a blank background. */
   window.setViewMode = setViewMode;
   window._cgOrigSetViewMode = setViewMode;
+  /* Cross-mode jump target for Type Nodes Mode (TYP-3): isolate a set of
+   * function node_ids in the Function view. Caller switches to 'fn' first. */
+  window.cgIsolateFunctionSet = function(ids) {
+    var present = {}, visited = {};
+    ALL_NODE_IDS.forEach(function(id) { present[id] = 1; });
+    (ids || []).forEach(function(id) { if (present[id]) visited[id] = 1; });
+    var n = Object.keys(visited).length;
+    if (!n) return 0;
+    _isolateNodes(visited);
+    var net = getNet();
+    if (net) { try { net.selectNodes(Object.keys(visited).slice(0, 1)); } catch (e) {} }
+    return n;
+  };
   window._cgSetCurrentMode = function(mode) {
     currentMode = mode;
     _updateLayoutBtns(mode);
@@ -4740,8 +5355,10 @@ _SIDEBAR_JS = """
       if (mode === 'inc') searchInput.placeholder = 'Header name...';
       else if (mode === 'module') searchInput.placeholder = 'Module name...';
       else if (mode === 'varflow') searchInput.placeholder = 'Variable name...';
+      else if (mode === 'types') searchInput.placeholder = 'Type / struct / field\u2026';
       else searchInput.placeholder = 'Function name...';
     }
+    if (searchHint && mode === 'types') searchHint.textContent = 'Search types \u2022 click a result to focus';
   };
 
   /* Auto-redirect huge graphs away from Function Nodes mode on initial load. */
@@ -6393,7 +7010,7 @@ _SIDEBAR_JS = """
           ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Input</span>'
             +'<span class="cg-vf-info-val cg-vf-var-name">'+esc(occ.connect_input_name)+'</span></div>'
             +(occ.custom_input_func ? '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Func</span>'
-            +'<span class="cg-vf-info-val" style="color:#4ec980">'+esc(occ.custom_input_func)+'</span></div>' : '')
+            +'<span class="cg-vf-info-val"><span class="cg-hl-fn">'+esc(occ.custom_input_func)+'</span></span></div>' : '')
           : '');
 
       /* member_access: show parent object (the access expression itself is
@@ -6432,11 +7049,15 @@ _SIDEBAR_JS = """
           +'</div>'
           +'<div class="cg-vf-info-row">'
             +'<span class="cg-vf-info-label">Type</span>'
-            +'<span class="cg-vf-info-val cg-vf-type-val">'+esc(typeTxt)+'</span>'
+            +'<span class="cg-vf-info-val cg-vf-type-val">'+_cgHiType(typeTxt)+'</span>'
           +'</div>'
+          +(function(){
+            if (!window.cgTypeFindByName || !window.cgTypeFindByName(typeTxt)) return '';
+            return '<div class="cg-vf-info-row"><span class="cg-vf-info-label">Type node</span><button class="cg-vf-type-chip" data-tt="'+esc(typeTxt)+'" title="Open this type in Type Nodes Mode">open</button></div>';
+          })()
           +'<div class="cg-vf-info-row">'
             +'<span class="cg-vf-info-label">Func</span>'
-            +'<span class="cg-vf-info-val cg-vf-fn-val" title="'+esc(occ.function_name)+'">'+esc(occ.function_name)+'</span>'
+            +'<span class="cg-vf-info-val cg-vf-fn-val" title="'+esc(occ.function_name)+'"><span class="cg-hl-fn">'+esc(occ.function_name)+'</span></span>'
           +'</div>'
           +'<div class="cg-vf-info-row">'
             +'<span class="cg-vf-info-label">File</span>'
@@ -6445,12 +7066,21 @@ _SIDEBAR_JS = """
           +(function(){ var _src = occ.full_source || occ.value; return _src
             ? '<div class="cg-vf-info-row cg-vf-source-row">'
                 +'<span class="cg-vf-info-label">Source</span>'
-                +'<span class="cg-vf-info-val cg-vf-source-val" title="'+esc(_src)+'">'+esc(_src)+'</span>'
+                +'<span class="cg-vf-info-val cg-vf-source-val" title="'+esc(_src)+'">'+_vfHiSourceText(_src, occ)+'</span>'
               +'</div>'
             : ''; })()
           +connectRow+inputNameRow+memberRows
         +'</div>'
         +(occ.doc_comment ? '<div class="cg-vf-doc-chip" title="' + esc(occ.doc_comment) + '">💬 ' + esc(occ.doc_comment) + '</div>' : '');
+
+      Array.prototype.forEach.call(el.querySelectorAll('.cg-vf-type-chip'), function(chip){
+        chip.addEventListener('click', function(e){
+          e.preventDefault();
+          e.stopPropagation();
+          var tt = chip.getAttribute('data-tt') || '';
+          if (window.cgTypeJumpFromName) window.cgTypeJumpFromName(tt);
+        });
+      });
 
       el.addEventListener('click', function(e){ e.stopPropagation(); _vfNodeClick(nd.id); });
       el.addEventListener('dblclick', function(e){ e.stopPropagation(); _vfOpenModal(nd.occ); });
@@ -6963,30 +7593,30 @@ _SIDEBAR_JS = """
     var srcLine = occ.full_source || occ.value || (occ.snippet ? occ.snippet.trim() : '');
     var valueRow = '';
     var snippetSec = srcLine
-      ? '<div class="cg-vf-modal-section"><div class="cg-vf-modal-section-title">Source</div><div class="cg-vf-modal-code">'+esc(srcLine)+'</div></div>'
+      ? '<div class="cg-vf-modal-section"><div class="cg-vf-modal-section-title">Source</div><div class="cg-vf-modal-code">'+_vfHiSourceText(srcLine, occ)+'</div></div>'
       : '';
     var localName = occ._localName || occ.name;
     var origName  = occ._origName  || occ.name;
     var showOrig  = localName.toLowerCase() !== origName.toLowerCase();
     var titleEl = document.getElementById('cg-vf-modal-title');
     var bodyEl  = document.getElementById('cg-vf-modal-body');
-    if (titleEl) titleEl.textContent = showOrig
-      ? localName + ' — originally “' + origName + '”'
-      : localName;
+    if (titleEl) titleEl.innerHTML = showOrig
+      ? '<span class="cg-hl-var">' + esc(localName) + '</span> — originally “<span class="cg-hl-var">' + esc(origName) + '</span>”'
+      : '<span class="cg-hl-var">' + esc(localName) + '</span>';
     var origRow = showOrig
-      ? '<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Tracked as</span><span class="cg-vf-modal-value mono">'+esc(origName)+'</span></div>'
+      ? '<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Tracked as</span><span class="cg-vf-modal-value mono"><span class="cg-hl-var">'+esc(origName)+'</span></span></div>'
       : '';
     if (bodyEl) bodyEl.innerHTML =
       '<div class="cg-vf-modal-section">'
         +'<div class="cg-vf-modal-section-title">Identity</div>'
         +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Category</span><span class="cg-vf-modal-value"><span class="cg-vf-cat-badge cg-vfc-'+esc(cat)+'">'+esc(catLbl)+'</span></span></div>'
-        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Variable</span><span class="cg-vf-modal-value mono">'+esc(localName)+'</span></div>'
+        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Variable</span><span class="cg-vf-modal-value mono"><span class="cg-hl-var">'+esc(localName)+'</span></span></div>'
         +origRow
-        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Type</span><span class="cg-vf-modal-value mono">'+esc(typeTxt)+'</span></div>'
+        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Type</span><span class="cg-vf-modal-value mono">'+_cgHiType(typeTxt)+'</span></div>'
       +'</div>'
       +'<div class="cg-vf-modal-section">'
         +'<div class="cg-vf-modal-section-title">Location</div>'
-        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Function</span><span class="cg-vf-modal-value mono">'+esc(occ.function_name)+'</span></div>'
+        +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Function</span><span class="cg-vf-modal-value mono"><span class="cg-hl-fn">'+esc(occ.function_name)+'</span></span></div>'
         +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">File</span><span class="cg-vf-modal-value mono">'+esc(ln)+'</span></div>'
         +(occ.file_path?'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Full path</span><span class="cg-vf-modal-value" style="font-size:10px;color:#5a6a7a">'+esc(occ.file_path)+'</span></div>':'')
       +'</div>'
@@ -7004,7 +7634,7 @@ _SIDEBAR_JS = """
       +(occ.connect_path ? '<div class="cg-vf-modal-section" style="border-left:3px solid #4A90D9">'
         +'<div class="cg-vf-modal-section-title" style="color:#4A90D9">Input File Connection</div>'
         +'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Full path</span><span class="cg-vf-modal-value mono" style="color:#4A90D9">'+esc(occ.connect_path)+'</span></div>'
-        +(occ.connect_input_name?'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Input var</span><span class="cg-vf-modal-value mono">'+esc(occ.connect_input_name)+'</span></div>':'')
+        +(occ.connect_input_name?'<div class="cg-vf-modal-row"><span class="cg-vf-modal-label">Input var</span><span class="cg-vf-modal-value mono"><span class="cg-hl-var">'+esc(occ.connect_input_name)+'</span></span></div>':'')
         +'</div>' : '')
       +snippetSec
       +(occ.doc_comment ? '<div class="cg-vf-modal-section" style="border-left:3px solid #5a8a4a">'
@@ -8482,6 +9112,7 @@ _SIDEBAR_JS = """
   (function(){
     var btnStraight     = document.getElementById('cg-btn-straight');
     var btnHierarchical = document.getElementById('cg-btn-hierarchical');
+    var btnFnCluster    = document.getElementById('cg-btn-fn-cluster');
     var btnSpread       = document.getElementById('cg-btn-sv-spread');
     var btnVfStraight   = document.getElementById('cg-btn-vf-straight');
     var btnSvStraight   = document.getElementById('cg-btn-sv-straight');
@@ -8529,6 +9160,12 @@ _SIDEBAR_JS = """
       _applyFnHierarchical(getNet());
     });
 
+    if (btnFnCluster) btnFnCluster.addEventListener('click', function(){
+      _fnClusterByFile = !_fnClusterByFile;
+      btnFnCluster.classList.toggle('active', _fnClusterByFile);
+      _fnApplyFileClusters(getNet());
+    });
+
     if (btnSpread) btnSpread.addEventListener('click', function(){
       _svWideSpread = !_svWideSpread;
       btnSpread.classList.toggle('active', _svWideSpread);
@@ -8560,6 +9197,7 @@ _SIDEBAR_JS = """
 
     /* reflect comfort defaults in button UI on load */
     if (btnHierarchical) btnHierarchical.classList.toggle('active', _fnHierarchical);
+    if (btnFnCluster) btnFnCluster.classList.toggle('active', _fnClusterByFile);
     if (btnSpread) btnSpread.classList.toggle('active', _svWideSpread);
 
     /* expose for initial activation after vis network is ready */
@@ -8845,6 +9483,11 @@ class HtmlRenderer(BaseRenderer):
     # PERF-8: node counts at/above this threshold enable viewport virtualisation
     # (CSS content-visibility) for the custom-DOM modes when virtualize_dom="auto".
     _VIRT_DOM_THRESHOLD = 400
+    # At/below this node count the Function view uses the syntax-highlighted
+    # signature-card overlay (must match FN_CARD_MAX in the sidebar JS). The
+    # underlying vis.js boxes are rendered fully transparent so the old plain
+    # boxes never flash before the cards take over.
+    _FN_CARD_MAX = 4000
 
     def _build_network(
         self, graph: CallGraph, layout: dict[str, tuple[float, float]],
@@ -8854,6 +9497,9 @@ class HtmlRenderer(BaseRenderer):
         n_nodes = len(graph.functions)
         large_graph = n_nodes >= self._LARGE_GRAPH_THRESHOLD
         huge_graph = n_nodes >= self._HUGE_GRAPH_THRESHOLD
+        # When the signature-card overlay is active, the vis.js boxes are made
+        # invisible up-front so the old plain-box render never flashes on load.
+        fn_cards_active = (not huge_graph) and (n_nodes <= self._FN_CARD_MAX)
 
         net = Network(
             height="100%", width="100%",
@@ -8891,6 +9537,14 @@ class HtmlRenderer(BaseRenderer):
             else {"enabled": True, "type": "cubicBezier",
                   "forceDirection": "vertical", "roundness": 0.4}
         )
+        # Executive-clean premium node styling (applied uniformly so both
+        # light and dark themes share the same refined geometry): softly
+        # rounded corners, generous label margin, a subtle depth shadow and a
+        # stronger selection accent. Shadow is perf-gated off for large graphs.
+        premium_shadow = (
+            {"enabled": True, "color": "rgba(0,0,0,0.22)", "size": 10, "x": 0, "y": 3}
+            if (not large_graph and not fn_cards_active) else {"enabled": False}
+        )
         vis_opts: dict = {
             "physics": {"enabled": False},
             "interaction": {
@@ -8899,6 +9553,19 @@ class HtmlRenderer(BaseRenderer):
                 "tooltipDelay": 9999,
                 "hideEdgesOnDrag": large_graph,
                 "hideEdgesOnZoom": large_graph,
+            },
+            "nodes": {
+                "shape": "box",
+                "shapeProperties": {"borderRadius": 6},
+                "margin": 10,
+                "borderWidthSelected": 3,
+                "font": {
+                    "size": 12,
+                    "face": "'JetBrains Mono','Cascadia Code','SF Mono',Consolas,'Segoe UI Mono',monospace",
+                    "color": "#ffffff",
+                    "strokeWidth": 0,
+                },
+                "shadow": premium_shadow,
             },
             "edges": {"smooth": edge_smooth},
         }
@@ -8923,14 +9590,37 @@ class HtmlRenderer(BaseRenderer):
             pos = all_positions[node_id]
             x, y = pos["x"], pos["y"]
 
-            net.add_node(
-                node_id, label=label, title="",
-                color={**color, "border": border_color},
-                borderWidth=(3 if (is_entry or rank) else 1),
-                shape="box",
-                font={"size": 11, "face": "monospace", "color": "#ffffff"},
-                size=20, x=int(x), y=int(y), physics=False,
-            )
+            if fn_cards_active:
+                # Invisible vis.js box: the signature card is the visible node.
+                # Kept as a sized, hit-testable node (label drives box size) so
+                # hover / click / drag / edge anchoring still work.
+                _TR = "rgba(0,0,0,0)"
+                net.add_node(
+                    node_id, label=label, title="",
+                    color={"background": _TR, "border": _TR,
+                           "highlight": {"background": _TR, "border": _TR},
+                           "hover": {"background": _TR, "border": _TR}},
+                    borderWidth=0, shape="box", shadow=False,
+                    font={
+                        "size": 12,
+                        "face": "'JetBrains Mono','Cascadia Code','SF Mono',Consolas,'Segoe UI Mono',monospace",
+                        "color": _TR, "strokeWidth": 0,
+                    },
+                    size=20, x=int(x), y=int(y), physics=False,
+                )
+            else:
+                net.add_node(
+                    node_id, label=label, title="",
+                    color={**color, "border": border_color},
+                    borderWidth=(3 if (is_entry or rank) else 1),
+                    shape="box",
+                    font={
+                        "size": 12,
+                        "face": "'JetBrains Mono','Cascadia Code','SF Mono',Consolas,'Segoe UI Mono',monospace",
+                        "color": "#ffffff", "strokeWidth": 0,
+                    },
+                    size=20, x=int(x), y=int(y), physics=False,
+                )
 
         if cfg.variables.track:
             for node_id, fn in graph.functions.items():
@@ -9067,6 +9757,7 @@ class HtmlRenderer(BaseRenderer):
         )
 
         var_flow_data = _build_var_flow_data(graph)
+        type_data = _build_type_data(graph)
 
         # Stable 12-char graph ID: SHA-1 of sorted function IDs.
         # Scopes all localStorage keys so different projects never share annotations.
@@ -9231,21 +9922,23 @@ class HtmlRenderer(BaseRenderer):
         #    architecture, confidence filter. All additive — existing IDs untouched.
         extras_payload = self._build_extras_payload(graph)
 
-        html = raw_html.replace("</head>", _SIDEBAR_CSS + "\n" + _CGX_EXTRAS_CSS + "\n" + _NODEBOOK_CSS + "\n</head>", 1)
+        html = raw_html.replace("</head>", _SIDEBAR_CSS + "\n" + _CGX_EXTRAS_CSS + "\n" + _NODEBOOK_CSS + "\n" + _TYPE_VIEW_CSS + "\n</head>", 1)
         html = html.replace(
             "<body>",
             "<body>\n" + sidebar_html + "\n"
             + '<div id="cg-script-view"></div>' + "\n"
             + varflow_div + "\n"
+            + '<div id="cg-type-view"></div>' + "\n"
             + _CGX_EXTRAS_HTML + "\n"
             + _NODEBOOK_HTML + "\n"
             + detail_div + "\n" + modal_div,
             1,
         )
         extras_js = _CGX_EXTRAS_JS.replace("CGX_EXTRAS_DATA", _emit(extras_payload))
+        type_view_js = _TYPE_VIEW_JS.replace("CG_TYPE_DATA", _emit(type_data))
         # PERF-5: only embed the ~6 KB inflate bootstrap when something was compressed.
         decomp_js = _DECOMP_JS if _used_compression[0] else ""
-        html = html.replace("</body>", decomp_js + sidebar_js + "\n" + extras_js + "\n" + _NODEBOOK_JS + "\n</body>", 1)
+        html = html.replace("</body>", decomp_js + sidebar_js + "\n" + extras_js + "\n" + _NODEBOOK_JS + "\n" + type_view_js + "\n</body>", 1)
         return html
 
     # ------------------------------------------------------------------ #
@@ -9401,7 +10094,72 @@ class HtmlRenderer(BaseRenderer):
             "secondary": slot2_data,
             "include_graph_enabled": cfg.include_graph.enabled and include_dict is not None,
             "include_show_system": bool(cfg.include_graph.follow_system),
+            "type_mode_enabled": bool(getattr(graph, "type_graph", None) and graph.type_graph.types),
         }
+
+
+def _build_type_data(graph: "CallGraph") -> dict:
+    """Serialize ``graph.type_graph`` into the Type Nodes Mode payload.
+
+    Shape: ``{types:{id:{...}}, edges:[...], roots:[...], stats:{...}}``.
+    Returns an empty skeleton when no type graph is present so the view JS
+    always has a well-formed object to read (graceful degradation, Rule).
+    """
+    tg = getattr(graph, "type_graph", None)
+    if tg is None or not getattr(tg, "types", None):
+        return {"types": {}, "edges": [], "roots": [], "stats": {}}
+
+    types_out: dict = {}
+    for tid, td in tg.types.items():
+        members_out = [
+            {
+                "name":           m.name,
+                "type_text":      m.type_text,
+                "is_pointer":     m.is_pointer,
+                "array_dims":     list(m.array_dims or []),
+                "bitfield_width": m.bitfield_width,
+                "is_func_ptr":    m.is_func_ptr,
+                "func_ptr_sig":   m.func_ptr_signature,
+                "canonical_type": m.canonical_type,
+                "anon_child_id":  m.anon_child_id,
+                "line":           m.line,
+            }
+            for m in td.members
+        ]
+        types_out[tid] = {
+            "id":          tid,
+            "name":        td.display_name,
+            "tag":         td.tag_name,
+            "kind":        td.kind,
+            "aliases":     list(td.aliases or []),
+            "file":        td.file,
+            "line":        td.line_start,
+            "members":     members_out,
+            "enum_values": [list(ev) for ev in (td.enum_values or [])],
+            "is_anon":     td.is_anonymous,
+            "parent":      td.parent_type_id,
+            "doc":         td.doc_comment,
+            "used_by":     list(td.used_by_functions or []),
+        }
+
+    edges_out = [
+        {
+            "src":     e.src_type_id,
+            "dst":     e.dst_type_id,
+            "kind":    e.kind,
+            "members": list(e.member_names or []),
+            "count":   e.count,
+        }
+        for e in tg.edges
+    ]
+
+    stats = tg.stats or tg.stats_dict()
+    return {
+        "types": types_out,
+        "edges": edges_out,
+        "roots": list(tg.roots or []),
+        "stats": stats,
+    }
 
 
 # ====================================================================== #
@@ -9547,7 +10305,7 @@ _CGX_EXTRAS_CSS = r"""
   content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
   background: #ff4040; border-radius: 6px 0 0 6px;
 }
-.cg-iv-node-label { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.cg-iv-node-label { font-weight: 600; font-size: 12px; color: #9CDCFE; overflow: hidden; text-overflow: ellipsis; }
 .cg-iv-node-sub   { font-size: 9px; color: rgba(255,255,255,0.35); overflow: hidden;
                     text-overflow: ellipsis; margin-top: 1px; }
 .cg-iv-node-badge { position: absolute; top: 4px; right: 6px;
@@ -9684,7 +10442,7 @@ _CGX_EXTRAS_CSS = r"""
 }
 .cgx-mv-card.open > .cgx-mv-head > .cgx-mv-toggle::before { content: '▾'; }
 .cgx-mv-card           > .cgx-mv-head > .cgx-mv-toggle::before { content: '▸'; }
-.cgx-mv-name { font-weight: 700; color: #e0e0e0; flex: 1; font-size: 13px; }
+.cgx-mv-name { font-weight: 700; color: #C586C0; flex: 1; font-size: 13px; }
 .cgx-mv-badge {
   color: #b0b8c0; font-size: 10px; padding: 1px 5px; border-radius: 3px;
   background: rgba(0,0,0,0.2);
@@ -9707,13 +10465,13 @@ _CGX_EXTRAS_CSS = r"""
 .cgx-mv-file-head:hover { background: rgba(116, 179, 247, 0.1); }
 .cgx-mv-file.open > .cgx-mv-file-head > .cgx-mv-ftoggle::before { content: '▾'; color:#74b3f7; }
 .cgx-mv-file           > .cgx-mv-file-head > .cgx-mv-ftoggle::before { content: '▸'; color:#74b3f7; }
-.cgx-mv-fname { font-family: monospace; color: #e0e0e0; flex: 1; font-size: 11px; }
+.cgx-mv-fname { font-family: monospace; color: #9CDCFE; flex: 1; font-size: 11px; }
 .cgx-mv-fmeta { color: #6a7a8a; font-size: 10px; }
 .cgx-mv-fns { display: none; padding: 2px 4px 2px 20px; }
 .cgx-mv-file.open > .cgx-mv-fns { display: block; }
 .cgx-mv-fn {
   padding: 2px 6px; cursor: pointer; border-radius: 3px;
-  color: #cfd6dd; font-family: monospace; font-size: 11px;
+  color: #DCDCAA; font-family: monospace; font-size: 11px;
 }
 .cgx-mv-fn:hover { background: #1e3050; color: #fff; }
 #cgx-mv-arrows {
@@ -9759,12 +10517,12 @@ body[data-theme="light"] .cgx-mv-dd-parent { color: #7a8898; }
 body[data-theme="light"] .cgx-mv-card { background: #fff; border-color: #c8d4de; box-shadow: 0 2px 6px rgba(0,0,0,0.08); color: #1a2535; }
 body[data-theme="light"] .cgx-mv-head { background: #edf2f7; border-bottom-color: #c8d4de; }
 body[data-theme="light"] .cgx-mv-head:hover { background: #e2eaf2; }
-body[data-theme="light"] .cgx-mv-name { color: #1a2535; }
+body[data-theme="light"] .cgx-mv-name { color: #7c3aed; }
 body[data-theme="light"] .cgx-mv-summary { color: #4a6070; }
 body[data-theme="light"] .cgx-mv-badge { background: rgba(0,0,0,0.06); color: #4a6070; }
-body[data-theme="light"] .cgx-mv-fname { color: #1a2535; }
+body[data-theme="light"] .cgx-mv-fname { color: #0369a1; }
 body[data-theme="light"] .cgx-mv-fmeta { color: #7a8898; }
-body[data-theme="light"] .cgx-mv-fn { color: #2c4455; }
+body[data-theme="light"] .cgx-mv-fn { color: #a16207; }
 body[data-theme="light"] .cgx-mv-fn:hover { background: #dbeafe; color: #1d4ed8; }
 body[data-theme="light"] .cgx-mv-fn.matched,
 body[data-theme="light"] .cgx-mv-file-head.matched { background: #dbeafe; color: #1d4ed8; }
@@ -9776,6 +10534,7 @@ body[data-theme="light"] #cg-iv-toolbar { border-bottom-color: #c8d4de; }
 body[data-theme="light"] #cgx-inc-close { background: #edf2f7; border-color: #c8d4de; color: #1a2535; }
 body[data-theme="light"] #cgx-inc-close:hover { background: #dde6f0; color: #1a2535; }
 body[data-theme="light"] #cg-iv-legend { background: rgba(240,245,250,0.93); border-bottom-color: #c8d4de; color: #4a6070; }
+body[data-theme="light"] .cg-iv-node-label { color: #0369a1; }
 body[data-theme="light"] .cgx-error-overlay { background: rgba(240,245,250,0.96); color: #92400e; }
 body[data-theme="light"] .cgx-error-overlay h3 { color: #92400e; }
 body[data-theme="light"] #cgx-kbd-hint { background: #f4f7fa; color: #4a6070; border-color: #c8d4de; }
@@ -9909,7 +10668,7 @@ _CGX_EXTRAS_JS = r"""
      a ➕ Capture button snapshots the current view and a 📓 Nodebook tab opens
      the saved-pages gallery. */
   var _modeRow = (btnVf && btnVf.parentElement) || (btnFn && btnFn.parentElement);
-  var btnCapture = null, btnNodebook = null;
+  var btnCapture = null, btnNodebook = null, btnType = null;
   if (_modeRow) {
     var _nbRow = _h('div', {'class':'cg-nb-btn-row'});
     btnCapture  = _h('button', {'class':'cg-btn','id':'cgx-btn-nb-capture','title':'Capture current view to Nodebook (N)'}, '➕ Capture');
@@ -9918,6 +10677,16 @@ _CGX_EXTRAS_JS = r"""
     _nbRow.appendChild(btnNodebook);
     if (_modeRow.parentElement) _modeRow.parentElement.insertBefore(_nbRow, _modeRow.nextSibling);
     else _modeRow.appendChild(_nbRow);
+
+    /* Type Nodes Mode gets its own row directly under the Capture/Nodebook row,
+       shown only when the backend detected type definitions (CGX.type_mode_enabled). */
+    if (CGX.type_mode_enabled) {
+      var _typeRow = _h('div', {'class':'cg-nb-btn-row'});
+      btnType = _h('button', {'class':'cg-btn','id':'cgx-btn-mode-types','title':'Type Nodes Mode — struct / union / enum / typedef / class graph (T)'}, '🧬 Type Mode');
+      _typeRow.appendChild(btnType);
+      if (_nbRow.parentElement) _nbRow.parentElement.insertBefore(_typeRow, _nbRow.nextSibling);
+      else _modeRow.appendChild(_typeRow);
+    }
   }
 
   /* Map render level -> internal mode id used by setViewMode.
@@ -12478,7 +13247,9 @@ _CGX_EXTRAS_JS = r"""
     if (mvEl) mvEl.classList.remove('active');
     var nbEl = document.getElementById('cg-nodebook');
     if (nbEl) nbEl.style.display = 'none';
-    [btnFn, btnSv, btnVf, btnInc, btnNodebook].forEach(function(b){ if (b) b.classList.remove('active'); });
+    var tyEl = document.getElementById('cg-type-view');
+    if (tyEl) tyEl.style.display = 'none';
+    [btnFn, btnSv, btnVf, btnInc, btnNodebook, btnType].forEach(function(b){ if (b) b.classList.remove('active'); });
     var mvCtl = document.getElementById('cgx-mv-controls');
     if (mvCtl) mvCtl.style.display = 'none';
   }
@@ -12580,6 +13351,12 @@ _CGX_EXTRAS_JS = r"""
     if (typeof window.cgNodebookOpen === 'function') window.cgNodebookOpen();
   }
 
+  function _activateType() {
+    _hideAllViews();
+    if (btnType) btnType.classList.add('active');
+    if (typeof window.cgTypeActivate === 'function') window.cgTypeActivate();
+  }
+
   /* edge-filter implementations per mode — all read window.cgEdgeFilter */
   function _filterNetEdges() {
     var net = _cgxGetNet();
@@ -12631,7 +13408,8 @@ _CGX_EXTRAS_JS = r"""
     module:  { view: 'cg-module-view',  enter: function(){ _safeActivate('Module View',     function(){ _activateModuleForSlot(_activeSlotId); }); }, edgeFilter: _filterModuleEdges },
     varflow: { view: 'cg-varflow-view', enter: function(){ _safeActivate('Variable Flow',   _activateVarFlow); },                              edgeFilter: null },
     inc:     { view: 'cgx-inc-view',    enter: function(){ _safeActivate('Include Graph',   _activateInclude); },                              edgeFilter: _filterIncludeEdges },
-    nodebook:{ view: 'cg-nodebook',     enter: function(){ _safeActivate('Nodebook',        _activateNodebook); },                             edgeFilter: null }
+    nodebook:{ view: 'cg-nodebook',     enter: function(){ _safeActivate('Nodebook',        _activateNodebook); },                             edgeFilter: null },
+    types:   { view: 'cg-type-view',    enter: function(){ _safeActivate('Type Nodes Mode', _activateType); },                                 edgeFilter: null }
   };
   window.RENDER_MODES = RENDER_MODES;
 
@@ -12692,6 +13470,7 @@ _CGX_EXTRAS_JS = r"""
   }
   if (btnInc) btnInc.addEventListener('click', function(){ window.setViewMode('inc'); });
   if (btnNodebook) btnNodebook.addEventListener('click', function(){ window.setViewMode('nodebook'); });
+  if (btnType) btnType.addEventListener('click', function(){ window.setViewMode('types'); });
   if (btnCapture) btnCapture.addEventListener('click', function(){ if (window.cgNodebookCaptureCurrent) window.cgNodebookCaptureCurrent(); });
 
   // Re-resolve SLOT button references and re-attach (some browsers cache).
@@ -13149,6 +13928,1366 @@ _NODEBOOK_JS = r"""
 
   if (document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', _wireNodebook); }
   else { _wireNodebook(); }
+})();
+</script>
+"""
+
+
+# ====================================================================== #
+# Type Nodes Mode (M2) — self-contained card view for the type graph.     #
+# Renders struct/union/enum/typedef/class cards with member rows, edges,  #
+# drag / pan / zoom, search over type + member names, kind filters, and a #
+# Nodebook capture/restore adapter. Reads the CG_TYPE_DATA payload.        #
+# ====================================================================== #
+_TYPE_VIEW_CSS = r"""
+<style id="cg-type-view-css">
+#cg-type-view {
+  display: none; flex: 1; height: 100vh; flex-direction: column;
+  overflow: hidden; background: #334155; position: relative;
+}
+#cg-tv-topbar {
+  padding: 12px 16px 11px; background: #23272e;
+  border-bottom: 1px solid #2d3139; flex-shrink: 0;
+}
+#cg-tv-topbar h2 {
+  font-size: 10px; font-weight: 600; color: #8090a0;
+  text-transform: uppercase; letter-spacing: 0.7px; margin: 0 0 9px;
+}
+#cg-tv-topbar-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#cg-tv-search-wrap { position: relative; display: flex; gap: 6px; flex: 1; min-width: 200px; }
+#cg-tv-search-input {
+  flex: 1; padding: 8px 12px; border: 1px solid #3d4451; border-radius: 5px;
+  background: #1a1d23; color: #e0e0e0; font-size: 13px; outline: none;
+}
+#cg-tv-search-input:focus { border-color: #4A90D9; }
+#cg-tv-search-clear {
+  background: #2d3139; color: #8090a0; border: none; border-radius: 5px;
+  padding: 0 10px; cursor: pointer; font-size: 14px;
+}
+#cg-tv-dropdown {
+  display: none; position: absolute; top: 40px; left: 0; right: 0; z-index: 200;
+  background: #23272e; border: 1px solid #3d4451; border-radius: 6px;
+  max-height: 320px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+}
+#cg-tv-dropdown.open { display: block; }
+.cg-tv-dd-item { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid #2d3139; }
+.cg-tv-dd-item:last-child { border-bottom: none; }
+.cg-tv-dd-item:hover, .cg-tv-dd-item.active { background: #1e2530; }
+.cg-tv-dd-nm { font-family: monospace; font-size: 12px; color: #74B3F7; font-weight: 700; }
+.cg-tv-dd-sub { font-size: 10px; color: #6a7a8a; }
+.cg-tv-btn {
+  background: #2d3139; color: #c0c8d4; border: 1px solid #3d4451; border-radius: 5px;
+  padding: 7px 11px; cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+.cg-tv-btn:hover { background: #353b47; }
+.cg-tv-btn.active { background: #1a3a5a; border-color: #4A90D9; color: #74B3F7; }
+#cg-tv-kindrow { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.cg-tv-kind-lbl { font-size: 10px; color: #8090a0; text-transform: uppercase; letter-spacing: 0.5px; }
+.cg-tv-kind-btn {
+  font-size: 11px; padding: 3px 9px; border-radius: 12px; cursor: pointer;
+  border: 1px solid #3d4451; background: #1a1d23; color: #c0c8d4;
+}
+.cg-tv-kind-btn.off { opacity: 0.4; }
+#cg-tv-stats { margin-left: auto; font-size: 10px; color: #5a6a7a; }
+#cg-tv-graph { flex: 1; position: relative; overflow: hidden; }
+#cg-tv-viewport {
+  width: 100%; height: 100%; position: absolute; inset: 0; overflow: hidden;
+  cursor: grab; -webkit-user-select: none; user-select: none;
+}
+#cg-tv-viewport.tv-panning { cursor: grabbing; }
+#cg-tv-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+#cg-tv-svg { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+.cg-tv-edge { pointer-events: stroke; cursor: pointer; transition: stroke-width .12s, opacity .12s, stroke .12s; }
+.cg-tv-edge:hover, .cg-tv-edge.tv-edge-active { stroke: #F7D774 !important; opacity: 1 !important; stroke-width: 3 !important; }
+.cg-tv-elabel { font-family: monospace; font-size: 10px; fill: #8090a0; pointer-events: none; }
+#cg-tv-placeholder {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  text-align: center; color: #5a6a7a; font-size: 15px; line-height: 1.7;
+}
+.cg-tv-card {
+  position: absolute; z-index: 10; width: 240px;
+  background: #23272e; border: 1px solid #2d3139; border-radius: 8px;
+  overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  transition: box-shadow .15s, opacity .15s;
+}
+.cg-tv-card:hover { box-shadow: 0 6px 22px rgba(0,0,0,0.7); }
+.cg-tv-card.tv-dim { opacity: 0.16; }
+.cg-tv-card.tv-root { border-color: #FFD700; box-shadow: 0 0 0 2px rgba(255,215,0,0.3); }
+.cg-tv-card.tv-match { border-color: #27AE60; box-shadow: 0 0 0 2px rgba(39,174,96,0.4); }
+.cg-tv-card.tv-flash { border-color: #F7D774; box-shadow: 0 0 0 3px rgba(247,215,116,0.6); }
+.cg-tv-hd {
+  display: flex; align-items: center; gap: 7px; padding: 8px 10px;
+  background: #1e2530; border-bottom: 1px solid #2d3139; cursor: move;
+}
+.cg-tv-hd:hover { background: #252c3a; }
+.cg-tv-collapse {
+  flex-shrink: 0; width: 15px; height: 15px; border: none; background: none;
+  color: #6a7a8a; font-size: 10px; cursor: pointer; padding: 0; line-height: 1;
+}
+.cg-tv-collapse:hover { color: #c0c8d4; }
+.cg-tv-card.tv-collapsed .cg-tv-body { display: none; }
+.cg-tv-name { font-family: monospace; font-size: 13px; font-weight: 700; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.cg-tv-name.k-struct  { color: #4A90D9; }
+.cg-tv-name.k-union   { color: #C77DD9; }
+.cg-tv-name.k-enum    { color: #E0A458; }
+.cg-tv-name.k-typedef { color: #58C9B9; }
+.cg-tv-name.k-class   { color: #7FB069; }
+.cg-tv-badge { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; letter-spacing: .3px; color: #10141a; }
+.cg-tv-badge.k-struct  { background: #4A90D9; }
+.cg-tv-badge.k-union   { background: #C77DD9; }
+.cg-tv-badge.k-enum    { background: #E0A458; }
+.cg-tv-badge.k-typedef { background: #58C9B9; }
+.cg-tv-badge.k-class   { background: #7FB069; }
+.cg-tv-sub { padding: 2px 10px 0; font-family: monospace; font-size: 10px; color: #6a7a8a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cg-tv-file { padding: 1px 10px 5px; font-size: 9px; color: #5a6a7a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cg-tv-file.cg-tv-file-link { cursor: pointer; border-bottom: 1px dotted #3a4a60; }
+.cg-tv-file.cg-tv-file-link:hover { color: #9eb4c8; border-bottom-color: #74B3F7; }
+.cg-tv-body { padding: 3px 0; max-height: 340px; overflow-y: auto; }
+.cg-tv-row {
+  display: flex; align-items: baseline; gap: 6px; padding: 3px 10px;
+  font-family: monospace; font-size: 11px; border-bottom: 1px solid #23272e;
+}
+.cg-tv-row:last-child { border-bottom: none; }
+.cg-tv-row.tv-row-hi { background: #342f18; }
+.cg-tv-mname { color: #e0e0e0; }
+.cg-tv-mname.cg-tv-enum-const { color: #D4C977; font-weight: 600; }
+.cg-tv-mtype { color: #8090a0; margin-left: auto; text-align: right; }
+.cg-tv-chip { color: #74B3F7; cursor: pointer; border-bottom: 1px dotted #4A90D9; }
+.cg-tv-chip:hover { color: #a9d0fb; }
+.cg-tv-eval { color: #E0A458; margin-left: auto; }
+.cg-tv-more { padding: 4px 10px; font-size: 10px; color: #5a6a7a; cursor: pointer; }
+.cg-tv-more:hover { color: #8090a0; }
+
+/* syntax highlighting for type text in member rows */
+.cg-tv-type-tok { font-family: monospace; }
+.cg-tv-type-tok.k-keyword-struct { color: #4A90D9; font-weight: 600; }
+.cg-tv-type-tok.k-keyword-union { color: #C77DD9; font-weight: 600; }
+.cg-tv-type-tok.k-keyword-enum { color: #E0A458; font-weight: 600; }
+.cg-tv-type-tok.k-keyword-qual { color: #B896DC; }
+.cg-tv-type-tok.k-builtin { color: #74B3F7; }
+.cg-tv-type-tok.k-type-struct { color: #7FB069; }
+.cg-tv-type-tok.k-type-union { color: #9CDCFE; }
+.cg-tv-type-tok.k-type-enum { color: #D4C977; }
+.cg-tv-type-tok.k-type-typedef { color: #58C9B9; }
+.cg-tv-type-tok.k-type-class { color: #7FB069; }
+.cg-tv-type-tok.k-punct { color: #8090a0; }
+.cg-tv-eval { color: #E0A458; }
+.cg-tv-eval.k-enum-const { color: #D4C977; font-weight: 600; }
+
+
+/* marquee box (multi-select) */
+.cg-tv-marquee-box {
+  position: absolute; z-index: 9999; pointer-events: none;
+  border: 1px solid #74b3f7; background: rgba(116,179,247,0.18);
+  box-shadow: inset 0 0 0 1px rgba(116,179,247,0.25);
+}
+
+.cg-tv-card.tv-multi-selected {
+  border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245,158,11,0.3);
+}
+
+/* anonymous inline group + extract button (TYP-4) */
+.cg-tv-anongroup { margin: 2px 6px 4px 16px; border-left: 2px solid #4A90D9;
+  background: rgba(74,144,217,0.06); border-radius: 0 4px 4px 0; }
+.cg-tv-anonhd { display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+  font-family: monospace; font-size: 10px; color: #74B3F7; }
+.cg-tv-anonlbl { flex: 1; }
+.cg-tv-extract { font-size: 9px; padding: 1px 6px; border-radius: 8px; cursor: pointer;
+  border: 1px solid #4A90D9; background: #1a3a5a; color: #74B3F7; }
+.cg-tv-extract:hover { background: #235079; }
+
+/* isolate breadcrumb (TYP-2) */
+#cg-tv-breadcrumb { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-top: 8px; font-size: 11px; color: #8090a0; }
+.cg-tv-crumb { cursor: pointer; color: #74B3F7; border-bottom: 1px dotted #4A90D9; }
+.cg-tv-crumb:hover { color: #a9d0fb; }
+.cg-tv-crumb-cur { color: #F7D774; border-bottom-color: #F7D774; font-weight: 700; }
+.cg-tv-crumb-all { color: #c0c8d4; border-bottom: none; font-weight: 700; }
+.cg-tv-crumb-sep { color: #5a6a7a; }
+.cg-tv-crumb-cnt { margin-left: auto; font-size: 10px; color: #5a6a7a; }
+
+/* right-click context menu (TYP-3) */
+.cg-tv-ctx { position: fixed; z-index: 9999; min-width: 200px; background: #23272e;
+  border: 1px solid #3d4451; border-radius: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+  padding: 4px 0; font-size: 12px; }
+.cg-tv-ctx-item { display: flex; align-items: baseline; gap: 8px; padding: 7px 12px; cursor: pointer; }
+.cg-tv-ctx-item:hover { background: #1e2530; }
+.cg-tv-ctx-dis { opacity: 0.4; cursor: default; }
+.cg-tv-ctx-dis:hover { background: none; }
+.cg-tv-ctx-lbl { color: #e0e0e0; flex: 1; }
+.cg-tv-ctx-sub { color: #6a7a8a; font-size: 10px; }
+
+/* ---------- light theme (cards follow dark/light toggle) ---------- */
+body[data-theme="light"] #cg-type-view { background: #dde3ea; }
+body[data-theme="light"] #cg-tv-topbar { background: #eef2f7; border-bottom-color: #c8d4de; }
+body[data-theme="light"] #cg-tv-topbar h2 { color: #5a6a7a; }
+body[data-theme="light"] #cg-tv-search-input { background: #fff; color: #1a2535; border-color: #c8d4de; }
+body[data-theme="light"] #cg-tv-search-clear { background: #dde6f0; color: #5a6a7a; }
+body[data-theme="light"] #cg-tv-dropdown { background: #fff; border-color: #c8d4de; box-shadow: 0 8px 24px rgba(0,0,0,0.18); }
+body[data-theme="light"] .cg-tv-dd-item { border-bottom-color: #e5edf4; }
+body[data-theme="light"] .cg-tv-dd-item:hover, body[data-theme="light"] .cg-tv-dd-item.active { background: #eef4fb; }
+body[data-theme="light"] .cg-tv-dd-nm { color: #1d4ed8; }
+body[data-theme="light"] .cg-tv-btn { background: #e6edf5; color: #2d3a4a; border-color: #c8d4de; }
+body[data-theme="light"] .cg-tv-btn:hover { background: #d8e3f0; }
+body[data-theme="light"] .cg-tv-btn.active { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+body[data-theme="light"] .cg-tv-kind-btn { background: #fff; color: #2d3a4a; border-color: #c8d4de; }
+body[data-theme="light"] .cg-tv-card { background: #fff; border-color: #c8d4de; box-shadow: 0 4px 14px rgba(0,0,0,0.10); }
+body[data-theme="light"] .cg-tv-card:hover { box-shadow: 0 6px 20px rgba(0,0,0,0.16); }
+body[data-theme="light"] .cg-tv-card.tv-root { border-color: #d4a017; box-shadow: 0 0 0 2px rgba(212,160,23,0.3); }
+body[data-theme="light"] .cg-tv-hd { background: #edf2f7; border-bottom-color: #c8d4de; }
+body[data-theme="light"] .cg-tv-hd:hover { background: #e2eaf2; }
+body[data-theme="light"] .cg-tv-collapse { color: #8090a0; }
+body[data-theme="light"] .cg-tv-collapse:hover { color: #2d3a4a; }
+body[data-theme="light"] .cg-tv-name { color: #1a2535; }
+body[data-theme="light"] .cg-tv-name.k-struct  { color: #1d4ed8; }
+body[data-theme="light"] .cg-tv-name.k-union   { color: #7c3aed; }
+body[data-theme="light"] .cg-tv-name.k-enum    { color: #b45309; }
+body[data-theme="light"] .cg-tv-name.k-typedef { color: #0d9488; }
+body[data-theme="light"] .cg-tv-name.k-class   { color: #059669; }
+body[data-theme="light"] .cg-tv-sub { color: #7a8898; }
+body[data-theme="light"] .cg-tv-file { color: #94a3b0; }
+body[data-theme="light"] .cg-tv-file.cg-tv-file-link { border-bottom-color: #b8c5d4; }
+body[data-theme="light"] .cg-tv-file.cg-tv-file-link:hover { color: #64748b; border-bottom-color: #3b82f6; }
+body[data-theme="light"] .cg-tv-row { border-bottom-color: #eef2f6; }
+body[data-theme="light"] .cg-tv-row.tv-row-hi { background: #fef3c7; }
+body[data-theme="light"] .cg-tv-mname { color: #1a2535; }
+body[data-theme="light"] .cg-tv-mname.cg-tv-enum-const { color: #ca8a04; }
+body[data-theme="light"] .cg-tv-mtype { color: #4a6070; }
+body[data-theme="light"] .cg-tv-chip { color: #1d4ed8; border-bottom-color: #3b82f6; }
+body[data-theme="light"] .cg-tv-chip:hover { color: #2563eb; }
+body[data-theme="light"] .cg-tv-eval { color: #b45309; }
+body[data-theme="light"] .cg-tv-more { color: #94a3b0; }
+body[data-theme="light"] .cg-tv-type-tok.k-keyword-struct { color: #1d4ed8; }
+body[data-theme="light"] .cg-tv-type-tok.k-keyword-union { color: #7c3aed; }
+body[data-theme="light"] .cg-tv-type-tok.k-keyword-enum { color: #b45309; }
+body[data-theme="light"] .cg-tv-type-tok.k-keyword-qual { color: #6d28d9; }
+body[data-theme="light"] .cg-tv-type-tok.k-builtin { color: #2563eb; }
+body[data-theme="light"] .cg-tv-type-tok.k-type-struct { color: #059669; }
+body[data-theme="light"] .cg-tv-type-tok.k-type-union { color: #0891b2; }
+body[data-theme="light"] .cg-tv-type-tok.k-type-enum { color: #ca8a04; }
+body[data-theme="light"] .cg-tv-type-tok.k-type-typedef { color: #0d9488; }
+body[data-theme="light"] .cg-tv-type-tok.k-type-class { color: #059669; }
+body[data-theme="light"] .cg-tv-type-tok.k-punct { color: #6b7280; }
+body[data-theme="light"] .cg-tv-marquee-box { border-color: #3b82f6; background: rgba(59,130,246,0.1); }
+body[data-theme="light"] .cg-tv-card.tv-multi-selected { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245,158,11,0.3); }
+body[data-theme="light"] .cg-tv-anongroup { background: rgba(59,130,246,0.06); border-left-color: #3b82f6; }
+body[data-theme="light"] .cg-tv-anonhd { color: #1d4ed8; }
+body[data-theme="light"] .cg-tv-extract { background: #dbeafe; color: #1d4ed8; border-color: #3b82f6; }
+body[data-theme="light"] .cg-tv-ctx { background: #fff; border-color: #c8d4de; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+body[data-theme="light"] .cg-tv-ctx-item:hover { background: #eef4fb; }
+body[data-theme="light"] .cg-tv-ctx-lbl { color: #1a2535; }
+body[data-theme="light"] .cg-tv-elabel { fill: #64748b; }
+</style>
+"""
+
+_TYPE_VIEW_JS = r"""
+<script id="cg-type-view-js">
+(function(){
+  var TD = CG_TYPE_DATA;
+  if (!TD || typeof TD !== 'object') TD = {};
+  if (!TD.types) TD.types = {};
+  if (!TD.edges) TD.edges = [];
+  if (!TD.roots) TD.roots = [];
+
+  var GID   = (window.cgGraphId || 'g');
+  var POSKEY = 'cgTypePos:' + GID;
+  var COLKEY = 'cgTypeCollapse:' + GID;
+  var LAYER_EDGE = { contains_value:1, array_of:1, alias_of:1, inherits:1 };
+  var KIND_BADGE = { struct:'struct', union:'union', enum:'enum', typedef:'typedef', class:'class' };
+  var EDGE_STYLE = {
+    contains_value:   { color:'#74B3F7', dash:'',        head:'tv-arrow' },
+    contains_pointer: { color:'#F9B06E', dash:'6,4',     head:'tv-arrow-p' },
+    array_of:         { color:'#58D68D', dash:'',        head:'tv-arrow' },
+    alias_of:         { color:'#C0C8D4', dash:'2,4',     head:'tv-arrow' },
+    inherits:         { color:'#E0A458', dash:'7,3,2,3', head:'tv-arrow' }
+  };
+  var NODE_GAP = 56, LAYER_VGAP = 80, MARGIN = 60;
+
+  var view, vp, canvas, svg, dd, searchInput, statsEl, placeholder, bc, ctxMenu;
+  var built = false;
+  var cards = {};                 // type_id -> {el, x, y, w, h}
+  var kindOn = { struct:true, union:true, enum:true, typedef:true, class:true };
+  var pan = { x: 0, y: 0, s: 1 };
+  var extracted = {};             // anon type_id -> 1 once popped out as its own card (TYP-4)
+  var isoActive = false, isoSet = {}, isoStack = [];   // isolate + breadcrumb (TYP-2)
+  var _tvTypeNameToTid = null;    // lower-case name/alias/tag -> tid (TYP-9)
+  var _tvMultiSel = {};           // type_id -> 1 for multi-selected cards
+  var _tvMarquee = null;          // marquee box state during drag
+  var _panning = false, _panStart = null;  // pan state
+
+  function _h(tag, attrs, txt){
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs){ if (k === 'class') e.className = attrs[k]; else e.setAttribute(k, attrs[k]); }
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function _loadJSON(key){ try { return JSON.parse(localStorage.getItem(key) || '{}'); } catch(e){ return {}; } }
+  function _saveJSON(key, obj){ try { localStorage.setItem(key, JSON.stringify(obj)); } catch(e){} }
+
+  function _tvEnsureTypeIndex(){
+    if (_tvTypeNameToTid) return;
+    _tvTypeNameToTid = {};
+    Object.keys(TD.types).forEach(function(tid){
+      var td = TD.types[tid] || {};
+      [td.name, td.tag].forEach(function(n){
+        var k = String(n || '').trim().toLowerCase();
+        if (k && _tvTypeNameToTid[k] == null) _tvTypeNameToTid[k] = tid;
+      });
+      (td.aliases || []).forEach(function(a){
+        var k = String(a || '').trim().toLowerCase();
+        if (k && _tvTypeNameToTid[k] == null) _tvTypeNameToTid[k] = tid;
+      });
+    });
+  }
+
+  function _tvFindTypeByName(typeText){
+    _tvEnsureTypeIndex();
+    var raw = String(typeText || '').trim();
+    if (!raw) return null;
+    var exact = _tvTypeNameToTid[raw.toLowerCase()];
+    if (exact) return exact;
+    var kw = {
+      struct:1, class:1, union:1, enum:1, typedef:1, const:1, volatile:1,
+      unsigned:1, signed:1, static:1, extern:1, register:1, restrict:1,
+      inline:1, mutable:1, int:1, char:1, float:1, double:1, short:1,
+      long:1, void:1, bool:1, wchar_t:1, size_t:1, ssize_t:1, int8_t:1,
+      int16_t:1, int32_t:1, int64_t:1, uint8_t:1, uint16_t:1, uint32_t:1,
+      uint64_t:1, uintptr_t:1, intptr_t:1, ptrdiff_t:1
+    };
+    var toks = raw.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+    for (var i = toks.length - 1; i >= 0; --i) {
+      var t = toks[i].toLowerCase();
+      if (kw[t]) continue;
+      if (_tvTypeNameToTid[t]) return _tvTypeNameToTid[t];
+    }
+    return null;
+  }
+
+  function _jumpTypeToInclude(filePath){
+    var fp = String(filePath || '').trim();
+    if (!fp || typeof window.setViewMode !== 'function') return;
+    window.setViewMode('inc');
+    setTimeout(function(){
+      try { if (window.cgxIncCenter) window.cgxIncCenter(fp); } catch(e) {}
+      try { if (window.cgxIncIsolate) window.cgxIncIsolate(fp, 9999, 'down'); } catch(e) {}
+    }, 120);
+  }
+
+  function _memberTypeText(m){
+    var t = m.type_text || '';
+    if (m.is_func_ptr && m.func_ptr_sig) return m.func_ptr_sig;
+    for (var i = 0; i < (m.is_pointer || 0); ++i) t += ' *';
+    (m.array_dims || []).forEach(function(d){ t += '[' + d + ']'; });
+    if (m.bitfield_width != null) t += ' : ' + m.bitfield_width;
+    return t.trim();
+  }
+
+  function _isInlineAnon(tid){
+    var td = TD.types[tid];
+    return !!(td && td.is_anon && td.parent && TD.types[td.parent] && !extracted[tid]);
+  }
+
+  function _buildCards(){
+    Object.keys(TD.types).forEach(function(tid){
+      if (_isInlineAnon(tid)) return;   // rendered inline inside its parent (TYP-4)
+      _buildCardFor(tid);
+    });
+  }
+
+  function _buildCardFor(tid){
+      var col = _loadJSON(COLKEY);
+      var td = TD.types[tid];
+      var card = _h('div', { 'class':'cg-tv-card', 'data-tid': tid });
+      if (TD.roots.indexOf(tid) >= 0) card.classList.add('tv-root');
+      if (col[tid]) card.classList.add('tv-collapsed');
+
+      var hd = _h('div', { 'class':'cg-tv-hd' });
+      var cb = _h('button', { 'class':'cg-tv-collapse', title:'Collapse' }, col[tid] ? '\u25B8' : '\u25BE');
+      cb.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+      cb.addEventListener('click', function(ev){
+        ev.stopPropagation();
+        card.classList.toggle('tv-collapsed');
+        var open = !card.classList.contains('tv-collapsed');
+        cb.textContent = open ? '\u25BE' : '\u25B8';
+        var c = _loadJSON(COLKEY); if (open) delete c[tid]; else c[tid] = 1; _saveJSON(COLKEY, c);
+        _measureOne(tid); _drawEdges();
+      });
+      hd.appendChild(cb);
+      var nameSpan = _h('span', { 'class':'cg-tv-name k-' + (td.kind || 'struct'), title: td.name }, td.name);
+      hd.appendChild(nameSpan);
+      hd.appendChild(_h('span', { 'class':'cg-tv-badge k-' + (td.kind || 'struct') }, KIND_BADGE[td.kind] || td.kind || ''));
+      card.appendChild(hd);
+
+      if (td.tag && td.aliases && td.aliases.length && td.tag !== td.name)
+        card.appendChild(_h('div', { 'class':'cg-tv-sub' }, td.kind + ' ' + td.tag));
+      if (td.file) {
+        var fchip = _h('div', { 'class':'cg-tv-file cg-tv-file-link', title: td.file + (td.line ? ':' + td.line : '') + ' - Open in Include Graph' },
+                       td.file.split('/').pop() + (td.line ? ':' + td.line : ''));
+        fchip.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+        fchip.addEventListener('click', function(ev){ ev.stopPropagation(); _jumpTypeToInclude(td.file); });
+        card.appendChild(fchip);
+      }
+
+      var body = _h('div', { 'class':'cg-tv-body' });
+      if (td.kind === 'enum') {
+        var evs = td.enum_values || [];
+        var shownE = Math.min(evs.length, 40);
+        for (var e = 0; e < shownE; ++e) {
+          var row = _h('div', { 'class':'cg-tv-row' });
+          var nameSpan = _h('span', { 'class':'cg-tv-mname cg-tv-enum-const' }, evs[e][0]);
+          row.appendChild(nameSpan);
+          if (evs[e][1] != null && evs[e][1] !== '')
+            row.appendChild(_h('span', { 'class':'cg-tv-eval' }, '= ' + evs[e][1]));
+          body.appendChild(row);
+        }
+        if (evs.length > shownE) body.appendChild(_h('div', { 'class':'cg-tv-more' }, '\u2026 ' + (evs.length - shownE) + ' more'));
+      } else {
+        var mem = td.members || [];
+        var shownN = 0, LIMIT = 14;
+        var addMore = function(){
+          var more = _h('div', { 'class':'cg-tv-more' }, '\u2026 ' + (mem.length - LIMIT) + ' more');
+          more.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+          more.addEventListener('click', function(ev){
+            ev.stopPropagation();
+            for (var j = LIMIT; j < mem.length; ++j) _appendMember(body, mem[j], tid, more);
+            more.remove(); _measureOne(tid); _drawEdges();
+          });
+          body.appendChild(more);
+        };
+        for (var mi = 0; mi < mem.length; ++mi) {
+          if (mi >= LIMIT) { addMore(); break; }
+          _appendMember(body, mem[mi], tid); shownN++;
+        }
+        if (!mem.length) body.appendChild(_h('div', { 'class':'cg-tv-more' }, '(no members)'));
+      }
+      card.appendChild(body);
+
+      hd.addEventListener('mousedown', function(ev){
+        if (ev.button === 0 && (ev.shiftKey || ev.ctrlKey)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          // Shift: add to selection
+          if (ev.shiftKey) {
+            var newSel = JSON.parse(JSON.stringify(_tvMultiSel));
+            newSel[tid] = 1;
+            _tvSetMultiSel(newSel);
+          }
+          // Ctrl: toggle
+          else if (ev.ctrlKey) {
+            var newSel2 = JSON.parse(JSON.stringify(_tvMultiSel));
+            newSel2[tid] = newSel2[tid] ? 0 : 1;
+            if (!newSel2[tid]) delete newSel2[tid];
+            _tvSetMultiSel(newSel2);
+          }
+        } else {
+          _startDrag(ev, tid);
+        }
+      });
+      hd.addEventListener('dblclick', function(ev){ ev.preventDefault(); _isolate(tid, true); });
+      card.addEventListener('contextmenu', function(ev){ ev.preventDefault(); _openCtxMenu(ev, tid); });
+      canvas.appendChild(card);
+      cards[tid] = { el: card, x: 0, y: 0, w: 0, h: 0 };
+  }
+
+  /* Append a member row; if it references an inline anonymous type, also append
+     that type's fields as an indented group with an "extract" button (TYP-4). */
+  function _appendMember(body, m, ownerTid, before){
+    var row = _memberRow(m, ownerTid);
+    if (before) body.insertBefore(row, before); else body.appendChild(row);
+    var aid = m.anon_child_id;
+    if (aid && _isInlineAnon(aid)) {
+      var grp = _inlineAnonGroup(aid, ownerTid);
+      if (before) body.insertBefore(grp, before); else body.appendChild(grp);
+    }
+  }
+
+  function _inlineAnonGroup(anonId, ownerTid){
+    var atd = TD.types[anonId];
+    var grp = _h('div', { 'class':'cg-tv-anongroup', 'data-anon': anonId });
+    var ghd = _h('div', { 'class':'cg-tv-anonhd' });
+    ghd.appendChild(_h('span', { 'class':'cg-tv-anonlbl' }, (atd.kind || 'anon') + ' { \u2026 }'));
+    var ext = _h('button', { 'class':'cg-tv-extract', title:'Extract as its own node' }, 'extract \u2b21');
+    ext.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+    ext.addEventListener('click', function(ev){ ev.stopPropagation(); _extractAnon(anonId, ownerTid); });
+    ghd.appendChild(ext);
+    grp.appendChild(ghd);
+    if (atd.kind === 'enum') {
+      (atd.enum_values || []).slice(0, 20).forEach(function(ev2){
+        var r = _h('div', { 'class':'cg-tv-row' });
+        r.appendChild(_h('span', { 'class':'cg-tv-mname' }, ev2[0]));
+        if (ev2[1] != null && ev2[1] !== '') r.appendChild(_h('span', { 'class':'cg-tv-eval' }, '= ' + ev2[1]));
+        grp.appendChild(r);
+      });
+    } else {
+      (atd.members || []).slice(0, 20).forEach(function(mm){ _appendMember(grp, mm, anonId); });
+    }
+    return grp;
+  }
+
+  function _extractAnon(anonId, ownerTid){
+    extracted[anonId] = 1;
+    if (!cards[anonId]) _buildCardFor(anonId);
+    var oc = cards[ownerTid], nc = cards[anonId];
+    if (oc && nc) { nc.x = oc.x + (oc.w || 240) + 60; nc.y = oc.y + 40; }
+    _measureOne(anonId); _applyPos(anonId);
+    var q = window.CSS && CSS.escape ? CSS.escape(anonId) : anonId;
+    var groups = canvas.querySelectorAll('.cg-tv-anongroup[data-anon="' + q + '"]');
+    Array.prototype.forEach.call(groups, function(g){ g.remove(); });
+    _measureOne(ownerTid);
+    _applyVisibility();
+    _drawEdges();
+    focusType(anonId);
+  }
+
+  function _memberRow(m, ownerTid){
+    var row = _h('div', { 'class':'cg-tv-row', 'data-mname': m.name });
+    row.appendChild(_h('span', { 'class':'cg-tv-mname' }, m.name));
+    var tt = _memberTypeText(m);
+    var canon = m.canonical_type || m.anon_child_id;
+    
+    // Build syntax-highlighted type text
+    var typeSpan = _h('span', {});
+    if (canon && TD.types[canon]) {
+      typeSpan.className = 'cg-tv-mtype cg-tv-chip';
+      typeSpan.title = 'Go to ' + tt;
+      typeSpan.addEventListener('mousedown', function(ev){ ev.stopPropagation(); });
+      typeSpan.addEventListener('click', function(ev){ ev.stopPropagation(); focusType(canon); });
+    } else {
+      typeSpan.className = 'cg-tv-mtype';
+    }
+    
+    // Syntax highlight: color keywords (struct, enum, union, etc) and built-in types
+    _highlightTypeText(typeSpan, tt, m);
+    row.appendChild(typeSpan);
+    return row;
+  }
+
+  function _highlightTypeText(container, typeText, memberObj){
+    var KEYWORDS = {
+      'struct': 'k-keyword-struct',
+      'union': 'k-keyword-union',
+      'enum': 'k-keyword-enum',
+      'unsigned': 'k-keyword-qual',
+      'signed': 'k-keyword-qual',
+      'const': 'k-keyword-qual',
+      'volatile': 'k-keyword-qual'
+    };
+    var BUILTIN = {
+      'int': 'k-builtin', 'char': 'k-builtin', 'float': 'k-builtin', 
+      'double': 'k-builtin', 'short': 'k-builtin', 'long': 'k-builtin',
+      'void': 'k-builtin', 'bool': 'k-builtin'
+    };
+    
+    // Split by whitespace but keep track of positions
+    var tokens = typeText.match(/\S+/g) || [];
+    tokens.forEach(function(tok, idx){
+      if (idx > 0) container.appendChild(document.createTextNode(' '));
+      
+      var span = document.createElement('span');
+      var cls = 'cg-tv-type-tok';
+      
+      // Check if it's a keyword
+      if (KEYWORDS[tok]) {
+        span.className = cls + ' ' + KEYWORDS[tok];
+      }
+      // Check if it's a builtin type
+      else if (BUILTIN[tok]) {
+        span.className = cls + ' ' + BUILTIN[tok];
+      }
+      // Check if it's a pointer or array marker
+      else if (tok === '*' || tok === '&' || tok === '[' || tok === ']') {
+        span.className = cls + ' k-punct';
+      }
+      // Check if it ends with [ or starts with ]
+      else if (tok.match(/^\[.*\]$/)) {
+        span.className = cls + ' k-punct';
+      }
+      // Otherwise it's a type name - color by canonical type
+      else {
+        var canon = memberObj.canonical_type || memberObj.anon_child_id;
+        if (canon && TD.types[canon]) {
+          var kind = TD.types[canon].kind || 'struct';
+          span.className = cls + ' k-type-' + kind;
+        } else {
+          span.className = cls;
+        }
+      }
+      
+      span.textContent = tok;
+      container.appendChild(span);
+    });
+  }
+
+  function _measureOne(tid){
+    var c = cards[tid]; if (!c) return;
+    c.w = c.el.offsetWidth; c.h = c.el.offsetHeight;
+  }
+  function _measureAll(){ Object.keys(cards).forEach(_measureOne); }
+
+  function _layout(){
+    var ids = Object.keys(TD.types);
+    var indeg = {}, adj = {};
+    ids.forEach(function(id){ indeg[id] = 0; adj[id] = []; });
+    TD.edges.forEach(function(e){
+      if (!LAYER_EDGE[e.kind]) return;
+      if (e.src === e.dst) return;
+      if (!TD.types[e.src] || !TD.types[e.dst]) return;
+      adj[e.src].push(e.dst); indeg[e.dst]++;
+    });
+    var layer = {}, roots = [];
+    ids.forEach(function(id){ if (indeg[id] === 0) roots.push(id); });
+    if (!roots.length) roots = ids.slice();
+    roots.forEach(function(id){ layer[id] = 0; });
+    // Longest-path relaxation (deterministic, cycle-safe via visit cap).
+    var changed = true, guard = 0;
+    while (changed && guard++ < ids.length + 4) {
+      changed = false;
+      ids.forEach(function(id){
+        var lv = layer[id] == null ? 0 : layer[id];
+        adj[id].forEach(function(d){
+          if (layer[d] == null || layer[d] < lv + 1) { layer[d] = lv + 1; changed = true; }
+        });
+      });
+    }
+    ids.forEach(function(id){ if (layer[id] == null) layer[id] = 0; });
+
+    var byLayer = {};
+    ids.forEach(function(id){ (byLayer[layer[id]] = byLayer[layer[id]] || []).push(id); });
+    var layers = Object.keys(byLayer).map(Number).sort(function(a,b){ return a - b; });
+
+    var saved = _loadJSON(POSKEY);
+    var yCursor = MARGIN;
+    layers.forEach(function(L){
+      var group = byLayer[L].sort();
+      var maxH = 0, x = MARGIN;
+      group.forEach(function(id){
+        var c = cards[id]; if (!c) return;
+        c.x = x; c.y = yCursor;
+        x += (c.w || 240) + NODE_GAP;
+        if ((c.h || 0) > maxH) maxH = c.h;
+      });
+      yCursor += maxH + LAYER_VGAP;
+    });
+    // Saved positions override the computed grid.
+    Object.keys(saved).forEach(function(id){
+      if (cards[id]) { cards[id].x = saved[id].x; cards[id].y = saved[id].y; }
+    });
+    _applyAllPos();
+  }
+
+  function _applyPos(tid){
+    var c = cards[tid]; if (!c) return;
+    c.el.style.left = c.x + 'px'; c.el.style.top = c.y + 'px';
+  }
+  function _applyAllPos(){ Object.keys(cards).forEach(_applyPos); }
+
+  function _rectEdge(cx, cy, w, h, tx, ty){
+    var dx = tx - cx, dy = ty - cy;
+    if (dx === 0 && dy === 0) return { x: cx, y: cy };
+    var hw = w / 2, hh = h / 2;
+    var sx = dx === 0 ? Infinity : hw / Math.abs(dx);
+    var sy = dy === 0 ? Infinity : hh / Math.abs(dy);
+    var s = Math.min(sx, sy);
+    return { x: cx + dx * s, y: cy + dy * s };
+  }
+
+  function _drawEdges(){
+    if (!svg) return;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var NS = 'http://www.w3.org/2000/svg';
+    var defs = document.createElementNS(NS, 'defs');
+    Object.keys(EDGE_STYLE).forEach(function(k){
+      var st = EDGE_STYLE[k];
+      var mk = document.createElementNS(NS, 'marker');
+      mk.setAttribute('id', 'tvm-' + k); mk.setAttribute('markerWidth','8'); mk.setAttribute('markerHeight','8');
+      mk.setAttribute('refX','7'); mk.setAttribute('refY','3'); mk.setAttribute('orient','auto');
+      var p = document.createElementNS(NS, 'path');
+      p.setAttribute('d','M0,0 L7,3 L0,6 Z'); p.setAttribute('fill', st.color);
+      mk.appendChild(p); defs.appendChild(mk);
+    });
+    svg.appendChild(defs);
+
+    // Build a map of edges for bidirectional detection
+    var edgeMap = {};
+    TD.edges.forEach(function(e, idx){
+      var key = e.src + '→' + e.dst;
+      edgeMap[key] = idx;
+    });
+
+    TD.edges.forEach(function(e, idx){
+      var a = cards[e.src], b = cards[e.dst];
+      if (!a || !b) return;
+      if (a.el.style.display === 'none' || b.el.style.display === 'none') return;
+      var st = EDGE_STYLE[e.kind] || EDGE_STYLE.contains_value;
+      var ax = a.x + a.w / 2, ay = a.y + a.h / 2;
+      var bx = b.x + b.w / 2, by = b.y + b.h / 2;
+      var p1, p2;
+      if (e.src === e.dst) {
+        // self-loop (linked list / tree pointer)
+        var lx = a.x + a.w, ly = a.y + 14;
+        var loop = document.createElementNS(NS, 'path');
+        loop.setAttribute('d', 'M' + lx + ',' + ly + ' q 34,-4 34,18 q 0,22 -34,10');
+        loop.setAttribute('fill','none'); loop.setAttribute('stroke', st.color);
+        loop.setAttribute('stroke-width','1.6'); if (st.dash) loop.setAttribute('stroke-dasharray', st.dash);
+        loop.setAttribute('marker-end','url(#tvm-' + e.kind + ')');
+        loop.setAttribute('class','cg-tv-edge'); svg.appendChild(loop);
+        return;
+      }
+      p1 = _rectEdge(ax, ay, a.w, a.h, bx, by);
+      p2 = _rectEdge(bx, by, b.w, b.h, ax, ay);
+      var path = document.createElementNS(NS, 'path');
+      var mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+      path.setAttribute('d', 'M' + p1.x + ',' + p1.y + ' Q ' + mx + ',' + (my - 18) + ' ' + p2.x + ',' + p2.y);
+      path.setAttribute('fill','none'); path.setAttribute('stroke', st.color);
+      path.setAttribute('stroke-width','1.6'); path.setAttribute('opacity','0.75');
+      if (st.dash) path.setAttribute('stroke-dasharray', st.dash);
+      path.setAttribute('marker-end','url(#tvm-' + e.kind + ')');
+      path.setAttribute('class','cg-tv-edge'); path.setAttribute('data-eid', idx);
+      var lbl = (e.members || []).slice(0, 3).join(', ');
+      if (e.count > 3) lbl += ' (' + e.count + ')';
+      path.addEventListener('mouseenter', function(){ _hiMembers(e, true); });
+      path.addEventListener('mouseleave', function(){ _hiMembers(e, false); });
+      svg.appendChild(path);
+      if (lbl) {
+        // Check for bidirectional edges and offset labels to avoid overlap
+        var reverseKey = e.dst + '→' + e.src;
+        var hasBidirectional = edgeMap[reverseKey] !== undefined;
+        var labelOffset = 0;
+        if (hasBidirectional) {
+          // Offset labels vertically: first edge offset down, reverse offset up
+          labelOffset = idx < edgeMap[reverseKey] ? 14 : -14;
+        }
+        var tx = document.createElementNS(NS, 'text');
+        tx.setAttribute('x', mx); tx.setAttribute('y', my - 20 + labelOffset);
+        tx.setAttribute('text-anchor','middle'); tx.setAttribute('class','cg-tv-elabel');
+        tx.textContent = lbl; svg.appendChild(tx);
+      }
+    });
+    _sizeSvg();
+  }
+
+  function _hiMembers(e, on){
+    var a = cards[e.src]; if (!a) return;
+    (e.members || []).forEach(function(nm){
+      var row = a.el.querySelector('.cg-tv-row[data-mname="' + (window.CSS && CSS.escape ? CSS.escape(nm) : nm) + '"]');
+      if (row) row.classList.toggle('tv-row-hi', on);
+    });
+  }
+
+  /* ---------- visibility (kind filter + isolate) ---------- */
+  function _applyVisibility(){
+    Object.keys(cards).forEach(function(id){
+      var td = TD.types[id]; if (!td) return;
+      var vis = (!isoActive || isoSet[id]) && kindOn[td.kind];
+      cards[id].el.style.display = vis ? '' : 'none';
+    });
+  }
+
+  /* ---------- multi-select + marquee ---------- */
+  function _tvApplyMultiSel(){
+    Object.keys(cards).forEach(function(tid){
+      cards[tid].el.classList.toggle('tv-multi-selected', !!_tvMultiSel[tid]);
+    });
+  }
+  function _tvSetMultiSel(map){
+    _tvMultiSel = map || {};
+    _tvApplyMultiSel();
+  }
+  function _mkRect(p1, p2){
+    var x1 = Math.min(p1.x, p2.x), x2 = Math.max(p1.x, p2.x);
+    var y1 = Math.min(p1.y, p2.y), y2 = Math.max(p1.y, p2.y);
+    return { left: x1, top: y1, right: x2, bottom: y2 };
+  }
+  function _setBoxRect(box, rect){
+    box.style.left = rect.left + 'px';
+    box.style.top = rect.top + 'px';
+    box.style.width = (rect.right - rect.left) + 'px';
+    box.style.height = (rect.bottom - rect.top) + 'px';
+  }
+  function _cardsInRect(rx, ry, rw, rh){
+    var out = [];
+    Object.keys(cards).forEach(function(tid){
+      var c = cards[tid];
+      var cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+      if (cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh) out.push(tid);
+    });
+    return out;
+  }
+
+  /* ---------- isolate + breadcrumb (TYP-2) ---------- */
+  function _isoClosure(tid){
+    var fwd = {}, bwd = {};
+    TD.edges.forEach(function(e){
+      (fwd[e.src] = fwd[e.src] || []).push(e.dst);
+      (bwd[e.dst] = bwd[e.dst] || []).push(e.src);
+    });
+    var set = {}; set[tid] = 1;
+    var st = [tid];
+    while (st.length){ var n = st.pop(); (fwd[n] || []).forEach(function(d){ if (!set[d]){ set[d] = 1; st.push(d); } }); }
+    st = [tid];
+    while (st.length){ var n2 = st.pop(); (bwd[n2] || []).forEach(function(s){ if (!set[s]){ set[s] = 1; st.push(s); } }); }
+    return set;
+  }
+
+  /* Depth/Direction-aware reachability (parity with cgxIncIsolate).
+   * dir: 'callees'/'down' = types this one contains/points to (forward);
+   *      'callers'/'up'   = types that contain/reference this one (backward);
+   *      'both'           = union of both.
+   * depth: 0 = target only; N = N hops; <=0/undefined/9999 = unlimited. */
+  function _isoReachable(tid, depth, dir){
+    var fwd = {}, bwd = {};
+    TD.edges.forEach(function(e){
+      (fwd[e.src] = fwd[e.src] || []).push(e.dst);
+      (bwd[e.dst] = bwd[e.dst] || []).push(e.src);
+    });
+    var normDir = (dir === 'callers' || dir === 'up')   ? 'up'   :
+                  (dir === 'callees' || dir === 'down') ? 'down' : 'both';
+    var maxDepth = (depth === undefined || depth === null || depth >= 9999) ? Infinity : depth;
+    var set = {}; set[tid] = 0;
+    function bfs(adj){
+      var q = [tid];
+      while (q.length){
+        var n = q.shift(); var d = set[n];
+        if (d >= maxDepth) continue;
+        (adj[n] || []).forEach(function(m){
+          if (set[m] === undefined || set[m] > d + 1){ set[m] = d + 1; q.push(m); }
+        });
+      }
+    }
+    if (normDir === 'down' || normDir === 'both') bfs(fwd);
+    if (normDir === 'up'   || normDir === 'both') bfs(bwd);
+    var out = {}; Object.keys(set).forEach(function(k){ out[k] = 1; });
+    return out;
+  }
+
+  function _isolate(tid, pushCrumb, depth, dir){
+    if (!cards[tid]) return;
+    isoActive = true;
+    isoSet = (depth === undefined && dir === undefined)
+             ? _isoClosure(tid)
+             : _isoReachable(tid, depth, dir);
+    if (pushCrumb){
+      // if re-isolating a type already in the trail, truncate to it
+      var at = isoStack.indexOf(tid);
+      if (at >= 0) isoStack = isoStack.slice(0, at + 1);
+      else isoStack.push(tid);
+    }
+    _applyVisibility(); _drawEdges(); _renderBreadcrumb();
+    focusType(tid);
+  }
+
+  function _showAllIso(){
+    isoActive = false; isoSet = {}; isoStack = [];
+    _applyVisibility(); _drawEdges(); _renderBreadcrumb();
+  }
+
+  function _renderBreadcrumb(){
+    if (!bc) return;
+    bc.innerHTML = '';
+    if (!isoActive || !isoStack.length){ bc.style.display = 'none'; return; }
+    bc.style.display = 'flex';
+    var all = _h('span', { 'class':'cg-tv-crumb cg-tv-crumb-all', title:'Show all types' }, '\u25a0 all');
+    all.addEventListener('click', _showAllIso);
+    bc.appendChild(all);
+    isoStack.forEach(function(tid, i){
+      bc.appendChild(_h('span', { 'class':'cg-tv-crumb-sep' }, '\u203a'));
+      var td = TD.types[tid];
+      var crumb = _h('span', { 'class':'cg-tv-crumb' + (i === isoStack.length - 1 ? ' cg-tv-crumb-cur' : '') },
+                     td ? td.name : tid);
+      crumb.addEventListener('click', function(){ _isolate(tid, true); });
+      bc.appendChild(crumb);
+    });
+    var cnt = Object.keys(isoSet).length;
+    bc.appendChild(_h('span', { 'class':'cg-tv-crumb-cnt' }, cnt + ' visible'));
+  }
+
+  /* ---------- context menu (TYP-3) ---------- */
+  function _closeCtxMenu(){ if (ctxMenu){ ctxMenu.remove(); ctxMenu = null; } }
+
+  function _openCtxMenu(ev, tid){
+    _closeCtxMenu();
+    var td = TD.types[tid]; if (!td) return;
+    ctxMenu = _h('div', { 'class':'cg-tv-ctx' });
+    var addItem = function(label, sub, fn, disabled){
+      var it = _h('div', { 'class':'cg-tv-ctx-item' + (disabled ? ' cg-tv-ctx-dis' : '') });
+      it.appendChild(_h('span', { 'class':'cg-tv-ctx-lbl' }, label));
+      if (sub) it.appendChild(_h('span', { 'class':'cg-tv-ctx-sub' }, sub));
+      if (!disabled) it.addEventListener('click', function(e2){ e2.stopPropagation(); _closeCtxMenu(); fn(); });
+      ctxMenu.appendChild(it);
+    };
+    addItem('Isolate containment', 'up + down', function(){ _isolate(tid, true); });
+    var nfn = (td.used_by || []).length;
+    addItem('Show functions using this type', nfn ? nfn + ' fn' : 'none',
+            function(){ _showFunctionsUsing(tid); }, !nfn);
+    document.body.appendChild(ctxMenu);
+    var mw = ctxMenu.offsetWidth || 220, mh = ctxMenu.offsetHeight || 80;
+    var x = Math.min(ev.clientX, window.innerWidth - mw - 8);
+    var y = Math.min(ev.clientY, window.innerHeight - mh - 8);
+    ctxMenu.style.left = x + 'px'; ctxMenu.style.top = y + 'px';
+  }
+
+  function _showFunctionsUsing(tid){
+    var td = TD.types[tid]; if (!td) return;
+    var ids = td.used_by || [];
+    if (!ids.length) return;
+    try { window.setViewMode('fn'); } catch(e){}
+    setTimeout(function(){
+      if (window.cgIsolateFunctionSet) window.cgIsolateFunctionSet(ids);
+    }, 140);
+  }
+
+  function _sizeSvg(){
+    var maxX = 1000, maxY = 800;
+    Object.keys(cards).forEach(function(id){
+      var c = cards[id]; maxX = Math.max(maxX, c.x + c.w + 200); maxY = Math.max(maxY, c.y + c.h + 200);
+    });
+    svg.setAttribute('width', maxX); svg.setAttribute('height', maxY);
+    canvas.style.width = maxX + 'px'; canvas.style.height = maxY + 'px';
+  }
+
+  /* ---------- pan / zoom / drag ---------- */
+  function _applyTransform(){
+    canvas.style.transform = 'translate(' + pan.x + 'px,' + pan.y + 'px) scale(' + pan.s + ')';
+  }
+  function _initViewport(){
+    vp.addEventListener('mousedown', function(ev){
+      if (ev.button !== 0 && ev.button !== 1) return;
+      if (ev.button === 1) {
+        ev.preventDefault();
+        _panning = true;
+        _panStart = { x: ev.clientX - pan.x, y: ev.clientY - pan.y };
+        vp.classList.add('tv-panning');
+        return;
+      }
+      var hdr = ev.target.closest && ev.target.closest('.cg-tv-hd');
+      if (hdr) {
+        // card header: will be handled by drag logic
+        return;
+      }
+      if (ev.target.closest && ev.target.closest('.cg-tv-card')) return;
+      
+      // Marquee on background (not on card)
+      var r = vp.getBoundingClientRect();
+      var p0 = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+      
+      ev.preventDefault();
+      ev.stopPropagation();
+      
+      var box = document.createElement('div');
+      box.className = 'cg-tv-marquee-box';
+      vp.appendChild(box);
+      
+      _tvMarquee = { box: box, start: p0, cur: p0 };
+    });
+    
+    window.addEventListener('mousemove', function(ev){
+      if (_tvMarquee) {
+        var r = vp.getBoundingClientRect();
+        _tvMarquee.cur = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+        var mr = _mkRect(_tvMarquee.start, _tvMarquee.cur);
+        _setBoxRect(_tvMarquee.box, mr);
+        return;
+      }
+      if (!_panning) return;
+      pan.x = ev.clientX - _panStart.x; pan.y = ev.clientY - _panStart.y; _applyTransform();
+    });
+    
+    window.addEventListener('mouseup', function(){
+      if (_tvMarquee) {
+        if (_tvMarquee.box && _tvMarquee.box.parentNode) _tvMarquee.box.parentNode.removeChild(_tvMarquee.box);
+        var mr = _mkRect(_tvMarquee.start, _tvMarquee.cur);
+        var ids = _cardsInRect(mr.left / pan.s - pan.x / pan.s, mr.top / pan.s - pan.y / pan.s,
+                               (mr.right - mr.left) / pan.s, (mr.bottom - mr.top) / pan.s);
+        _tvMarquee = null;
+        
+        // Apply multi-select based on modifiers
+        var newSel = {};
+        if (!ev.ctrlKey && !ev.shiftKey) {
+          // Plain click: replace
+          ids.forEach(function(id){ newSel[id] = 1; });
+        } else if (ev.shiftKey) {
+          // Shift: add to current
+          Object.keys(_tvMultiSel).forEach(function(id){ newSel[id] = 1; });
+          ids.forEach(function(id){ newSel[id] = 1; });
+        } else if (ev.ctrlKey) {
+          // Ctrl: toggle
+          newSel = JSON.parse(JSON.stringify(_tvMultiSel));
+          ids.forEach(function(id){
+            if (newSel[id]) delete newSel[id];
+            else newSel[id] = 1;
+          });
+        }
+        _tvSetMultiSel(newSel);
+        return;
+      }
+      _panning = false; vp.classList.remove('tv-panning');
+    });
+    
+    vp.addEventListener('wheel', function(ev){
+      ev.preventDefault();
+      var r = vp.getBoundingClientRect();
+      var mx = ev.clientX - r.left, my = ev.clientY - r.top;
+      var old = pan.s;
+      var ns = old * (ev.deltaY < 0 ? 1.1 : 0.9);
+      ns = Math.max(0.15, Math.min(2.5, ns));
+      pan.x = mx - (mx - pan.x) * (ns / old);
+      pan.y = my - (my - pan.y) * (ns / old);
+      pan.s = ns; _applyTransform();
+    }, { passive: false });
+  }
+
+  var _drag = null;
+  function _startDrag(ev, tid){
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    
+    var c = cards[tid]; if (!c) return;
+    
+    // Collect all cards to drag (this card + multi-selected if this is part of selection)
+    var toDrag = [];
+    var isMulti = !!_tvMultiSel[tid];
+    if (isMulti) {
+      // Dragging a multi-selected card: move all selected cards
+      Object.keys(_tvMultiSel).forEach(function(id){
+        if (_tvMultiSel[id] && cards[id]) {
+          toDrag.push({ tid: id, card: cards[id], ox: cards[id].x, oy: cards[id].y });
+        }
+      });
+    } else {
+      // Single card drag, but also clear multi-select
+      toDrag.push({ tid: tid, card: c, ox: c.x, oy: c.y });
+      _tvSetMultiSel({});
+    }
+    
+    _drag = { toDrag: toDrag, sx: ev.clientX, sy: ev.clientY };
+    
+    var mv = function(e2){
+      if (!_drag) return;
+      var dx = (e2.clientX - _drag.sx) / pan.s;
+      var dy = (e2.clientY - _drag.sy) / pan.s;
+      _drag.toDrag.forEach(function(it){
+        it.card.x = it.ox + dx;
+        it.card.y = it.oy + dy;
+        _applyPos(it.tid);
+      });
+      _drawEdges();
+    };
+    
+    var up = function(){
+      window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
+      var sv = _loadJSON(POSKEY);
+      _drag.toDrag.forEach(function(it){
+        sv[it.tid] = { x: it.card.x, y: it.card.y };
+      });
+      _saveJSON(POSKEY, sv);
+      _drag = null;
+    };
+    
+    window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
+  }
+
+  /* ---------- search ---------- */
+  function _matches(q){
+    q = q.toLowerCase(); var out = [];
+    Object.keys(TD.types).forEach(function(tid){
+      var td = TD.types[tid]; var hit = null;
+      if ((td.name || '').toLowerCase().indexOf(q) >= 0) hit = 'name';
+      else if ((td.tag || '').toLowerCase().indexOf(q) >= 0) hit = 'tag';
+      else if ((td.aliases || []).some(function(a){ return a.toLowerCase().indexOf(q) >= 0; })) hit = 'alias';
+      else if (td.kind === 'enum') {
+        var ec = (td.enum_values || []).filter(function(ev){ return (ev[0] || '').toLowerCase().indexOf(q) >= 0; });
+        if (ec.length) hit = 'const:' + ec[0][0];
+      }
+      if (!hit) {
+        var mm = (td.members || []).filter(function(m){ return (m.name || '').toLowerCase().indexOf(q) >= 0; });
+        if (mm.length) hit = 'member:' + mm[0].name;
+      }
+      if (hit) out.push({ tid: tid, hit: hit });
+    });
+    return out.slice(0, 40);
+  }
+  function _renderDropdown(list){
+    dd.innerHTML = '';
+    if (!list.length) { dd.classList.remove('open'); return; }
+    list.forEach(function(it){
+      var td = TD.types[it.tid];
+      var row = _h('div', { 'class':'cg-tv-dd-item' });
+      row.appendChild(_h('span', { 'class':'cg-tv-dd-nm' }, td.name));
+      var sub = '  ' + td.kind;
+      if (it.hit.indexOf('member:') === 0) sub += '  \u2022 field ' + it.hit.slice(7);
+      else if (it.hit.indexOf('const:') === 0) sub += '  \u2022 value ' + it.hit.slice(6);
+      row.appendChild(_h('span', { 'class':'cg-tv-dd-sub' }, sub));
+      row.addEventListener('click', function(){ focusType(it.tid); dd.classList.remove('open'); });
+      dd.appendChild(row);
+    });
+    dd.classList.add('open');
+  }
+  function _applyFilter(q){
+    if (!q) { Object.keys(cards).forEach(function(id){ cards[id].el.classList.remove('tv-dim','tv-match'); }); return; }
+    var set = {}; _matches(q).forEach(function(it){ set[it.tid] = 1; });
+    Object.keys(cards).forEach(function(id){
+      cards[id].el.classList.toggle('tv-match', !!set[id]);
+      cards[id].el.classList.toggle('tv-dim', !set[id]);
+    });
+  }
+
+  function focusType(tid){
+    var c = cards[tid]; if (!c) return;
+    if (c.el.classList.contains('tv-collapsed')) { /* keep as is */ }
+    var r = vp.getBoundingClientRect();
+    pan.s = Math.max(0.6, Math.min(pan.s, 1.2));
+    pan.x = r.width / 2 - (c.x + c.w / 2) * pan.s;
+    pan.y = r.height / 2 - (c.y + c.h / 2) * pan.s;
+    _applyTransform();
+    c.el.classList.add('tv-flash');
+    setTimeout(function(){ c.el.classList.remove('tv-flash'); }, 1400);
+  }
+  window.cgTypeFocus = focusType;
+  window.cgTypeFindByName = _tvFindTypeByName;
+  window.cgTypeJumpFromName = function(typeText){
+    var tid = _tvFindTypeByName(typeText);
+    if (!tid) return false;
+    if (typeof window.setViewMode === 'function') window.setViewMode('types');
+    setTimeout(function(){ if (window.cgTypeFocus) window.cgTypeFocus(tid); }, 90);
+    return true;
+  };
+
+  /* ---- Shared-sidebar parity APIs (mirror cgxInc*): isolate-as-filter,
+   *      expand, center, highlight, show-all, fit. Reused by the left toolbar
+   *      via the currentMode==='types' branches. -------------------------- */
+  function _tvResolveTarget(target){
+    if (target == null) return null;
+    if (cards[target]) return target;              // already a type_id
+    return _tvFindTypeByName(String(target));      // name / alias / tag / verbatim
+  }
+  window.cgxTypeIsolate = function(target, depth, dir){
+    var tid = _tvResolveTarget(target);
+    if (!tid) return 0;
+    _isolate(tid, true, depth, dir);
+    return Object.keys(isoSet).length;
+  };
+  window.cgxTypeExpand = function(target, depth, dir){
+    var tid = _tvResolveTarget(target);
+    if (!tid) return 0;
+    var reach = _isoReachable(tid, depth, dir);
+    if (isoActive){ Object.keys(reach).forEach(function(k){ isoSet[k] = 1; }); }
+    else { isoActive = true; isoSet = reach; }
+    _applyVisibility(); _drawEdges(); _renderBreadcrumb();
+    focusType(tid);
+    return Object.keys(reach).length;
+  };
+  window.cgxTypeCenter = function(target){
+    var tid = _tvResolveTarget(target);
+    if (tid) focusType(tid);
+    return !!tid;
+  };
+  window.cgxTypeHighlight = function(targets){
+    if (!targets) return 0;
+    if (!Array.isArray(targets)) targets = [targets];
+    var sel = {}, first = null;
+    targets.forEach(function(t){
+      var tid = _tvResolveTarget(t);
+      if (tid){ sel[tid] = 1; if (!first) first = tid; }
+    });
+    _tvSetMultiSel(sel);
+    if (first) focusType(first);
+    return Object.keys(sel).length;
+  };
+  /* Shared-sidebar type search: routes #cg-search when in Type Nodes mode
+     (mirrors cgxModuleSearch / cgxIncSearch). Dims non-matches, fills the
+     sidebar dropdown with matched types, and focuses on click / Enter. */
+  function _tvEscHtml(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  window.cgxTypeSearch = function(q){
+    var lq = (q||'').trim();
+    _applyFilter(lq);
+    var dd2 = document.getElementById('cg-search-dropdown');
+    var inp = document.getElementById('cg-search');
+    var hintEl = document.getElementById('cg-search-hint');
+    if (!dd2 || !inp) return;
+    if (!lq){ dd2.style.display='none'; dd2.innerHTML=''; if(hintEl) hintEl.textContent='Search types \u2022 click a result to focus'; return; }
+    var list = _matches(lq);
+    if (hintEl) hintEl.textContent = list.length===0 ? 'No matches' : (list.length===1 ? '1 match' : list.length+' matches');
+    if (!list.length){ dd2.style.display='none'; dd2.innerHTML=''; return; }
+    var rect = inp.getBoundingClientRect();
+    dd2.style.top=(rect.bottom+2)+'px'; dd2.style.left=rect.left+'px'; dd2.style.width=rect.width+'px';
+    var llq = lq.toLowerCase();
+    function _hi(text){ var t=String(text||''); var i=t.toLowerCase().indexOf(llq); if(i<0) return _tvEscHtml(t);
+      return _tvEscHtml(t.slice(0,i))+'<span class="cg-sd-mark">'+_tvEscHtml(t.slice(i,i+lq.length))+'</span>'+_tvEscHtml(t.slice(i+lq.length)); }
+    dd2.innerHTML = list.map(function(it){
+      var td = TD.types[it.tid]||{}; var sub = td.kind||'type';
+      if (it.hit.indexOf('member:')===0) sub += ' \u00b7 field '+it.hit.slice(7);
+      else if (it.hit.indexOf('const:')===0) sub += ' \u00b7 value '+it.hit.slice(6);
+      var fn = (td.file||'').replace(/.*[\\\\/]/g,'');
+      return '<div class="cg-sd-item" data-tid="'+_tvEscHtml(it.tid)+'">'
+        +'<span class="cg-sd-name">'+_hi(td.name||it.tid)+'</span>'
+        +'<span class="cg-sd-meta">'+_tvEscHtml(sub)+(fn?(' \u00b7 '+_tvEscHtml(fn)):'')+'</span></div>';
+    }).join('');
+    Array.prototype.forEach.call(dd2.querySelectorAll('.cg-sd-item'), function(item){
+      item.addEventListener('mousedown', function(e){
+        e.preventDefault();
+        var tid=item.dataset.tid;
+        if(inp && TD.types[tid]) inp.value = TD.types[tid].name||'';
+        dd2.style.display='none';
+        var sel={}; sel[tid]=1; try{ _tvSetMultiSel(sel); }catch(_e){}
+        focusType(tid);
+      });
+    });
+    dd2.style.display='block';
+  };
+  window.cgxTypeSearchEnter = function(q){
+    var list = _matches((q||'').trim());
+    if (list.length){ var sel={}; sel[list[0].tid]=1; try{ _tvSetMultiSel(sel); }catch(_e){} focusType(list[0].tid); }
+    return list.length;
+  };
+  window.cgxTypeShowAll = function(){ _showAllIso(); _tvSetMultiSel({}); };
+  window.cgxTypeClearFocus = window.cgxTypeShowAll;
+  window.cgxTypeFit = function(){ _fit(); };
+  window.cgxTypeSaveLayout = function(){
+    var sv = {}; Object.keys(cards).forEach(function(id){ sv[id] = { x: cards[id].x, y: cards[id].y }; });
+    _saveJSON(POSKEY, sv);
+  };
+  window.cgxTypeResetLayout = function(){
+    try { localStorage.removeItem(POSKEY); } catch(e){}
+    _measureAll(); _layout(); _drawEdges(); _fit();
+  };
+  window.cgxTypeClearSaved = function(){ try { localStorage.removeItem(POSKEY); } catch(e){} };
+
+  function _fit(){
+    var ids = Object.keys(cards); if (!ids.length) return;
+    var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    ids.forEach(function(id){ var c = cards[id];
+      minX = Math.min(minX, c.x); minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.w); maxY = Math.max(maxY, c.y + c.h); });
+    var r = vp.getBoundingClientRect();
+    var gw = maxX - minX + 120, gh = maxY - minY + 120;
+    pan.s = Math.max(0.15, Math.min(1.4, Math.min(r.width / gw, r.height / gh)));
+    pan.x = (r.width - gw * pan.s) / 2 - minX * pan.s + 60 * pan.s;
+    pan.y = (r.height - gh * pan.s) / 2 - minY * pan.s + 60 * pan.s;
+    _applyTransform();
+  }
+
+  function _buildTopbar(){
+    var bar = _h('div', { id:'cg-tv-topbar' });
+    bar.appendChild(_h('h2', null, 'Type Nodes Mode'));
+    var row = _h('div', { id:'cg-tv-topbar-row' });
+    var sw = _h('div', { id:'cg-tv-search-wrap' });
+    searchInput = _h('input', { id:'cg-tv-search-input', type:'text', placeholder:'Search type / alias / field name\u2026', autocomplete:'off' });
+    var clr = _h('button', { id:'cg-tv-search-clear', title:'Clear' }, '\u00d7');
+    dd = _h('div', { id:'cg-tv-dropdown' });
+    sw.appendChild(searchInput); sw.appendChild(clr); sw.appendChild(dd);
+    row.appendChild(sw);
+    var fit = _h('button', { 'class':'cg-tv-btn', title:'Fit all cards' }, 'Fit');
+    fit.addEventListener('click', _fit);
+    var reset = _h('button', { 'class':'cg-tv-btn', title:'Reset saved layout' }, 'Reset layout');
+    reset.addEventListener('click', function(){
+      try { localStorage.removeItem(POSKEY); } catch(e){}
+      _measureAll(); _layout(); _drawEdges(); _fit();
+    });
+    row.appendChild(fit); row.appendChild(reset);
+    statsEl = _h('span', { id:'cg-tv-stats' });
+    row.appendChild(statsEl);
+    bar.appendChild(row);
+
+    var krow = _h('div', { id:'cg-tv-kindrow' });
+    krow.appendChild(_h('span', { 'class':'cg-tv-kind-lbl' }, 'Kinds:'));
+    ['struct','union','enum','typedef','class'].forEach(function(k){
+      var b = _h('button', { 'class':'cg-tv-kind-btn', 'data-k':k }, k);
+      b.addEventListener('click', function(){
+        kindOn[k] = !kindOn[k]; b.classList.toggle('off', !kindOn[k]);
+        _applyVisibility();
+        _drawEdges();
+      });
+      krow.appendChild(b);
+    });
+    bar.appendChild(krow);
+
+    bc = _h('div', { id:'cg-tv-breadcrumb' });
+    bc.style.display = 'none';
+    bar.appendChild(bc);
+
+    searchInput.addEventListener('input', function(){
+      var q = searchInput.value.trim();
+      _applyFilter(q);
+      if (q) _renderDropdown(_matches(q)); else dd.classList.remove('open');
+    });
+    searchInput.addEventListener('keydown', function(ev){
+      if (ev.key === 'Enter') { var m = _matches(searchInput.value.trim()); if (m.length) { focusType(m[0].tid); dd.classList.remove('open'); } }
+      else if (ev.key === 'Escape') { dd.classList.remove('open'); }
+    });
+    clr.addEventListener('click', function(){ searchInput.value = ''; _applyFilter(''); dd.classList.remove('open'); searchInput.focus(); });
+    document.addEventListener('click', function(ev){ if (!sw.contains(ev.target)) dd.classList.remove('open'); _closeCtxMenu(); });
+    document.addEventListener('keydown', function(ev){
+      if (ev.key === 'Escape'){ _closeCtxMenu(); if (isoActive) _showAllIso(); }
+    });
+    return bar;
+  }
+
+  function ensureBuilt(){
+    if (built) return;
+    view = document.getElementById('cg-type-view');
+    if (!view) return;
+    built = true;
+    view.appendChild(_buildTopbar());
+    var graph = _h('div', { id:'cg-tv-graph' });
+    vp = _h('div', { id:'cg-tv-viewport' });
+    canvas = _h('div', { id:'cg-tv-canvas' });
+    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('id', 'cg-tv-svg');
+    canvas.appendChild(svg);
+    vp.appendChild(canvas); graph.appendChild(vp); view.appendChild(graph);
+
+    var n = Object.keys(TD.types).length;
+    if (!n) {
+      placeholder = _h('div', { id:'cg-tv-placeholder' });
+      placeholder.innerHTML = 'No type definitions detected in this project.<br>' +
+        '<span style="font-size:12px">Type Nodes Mode visualises struct / union / enum / typedef / class relationships (C/C++).</span>';
+      graph.appendChild(placeholder);
+      if (statsEl) statsEl.textContent = '0 types';
+      return;
+    }
+    _buildCards();
+    _initViewport();
+    // Measure + layout must run while the view is visible (offsetWidth != 0).
+    requestAnimationFrame(function(){
+      _measureAll(); _layout(); _drawEdges(); _fit();
+      if (statsEl) {
+        var s = TD.stats || {};
+        statsEl.textContent = (s.types || n) + ' types \u00b7 ' + (TD.edges.length) + ' edges \u00b7 ' + (TD.roots.length) + ' roots';
+      }
+    });
+  }
+
+  /* ---------- public activator + Nodebook adapter ---------- */
+  window.cgTypeActivate = function(){
+    var v = document.getElementById('cg-type-view');
+    if (v) v.style.display = 'flex';
+    ensureBuilt();
+    // Re-layout if this is the first real paint (cards were 0-width before show).
+    if (built && Object.keys(cards).length) {
+      var anyUnmeasured = Object.keys(cards).some(function(id){ return !cards[id].w; });
+      if (anyUnmeasured) requestAnimationFrame(function(){ _measureAll(); _layout(); _drawEdges(); _fit(); });
+    }
+  };
+
+  window.CG_NB_ADAPTERS = window.CG_NB_ADAPTERS || {};
+  window.CG_NB_ADAPTERS['types'] = {
+    capture: function(){
+      var pos = {}; Object.keys(cards).forEach(function(id){ pos[id] = { x: cards[id].x, y: cards[id].y }; });
+      return { pan: { x: pan.x, y: pan.y, s: pan.s }, pos: pos, search: searchInput ? searchInput.value : '' };
+    },
+    restore: function(state){
+      window.cgTypeActivate();
+      if (!state) return;
+      var apply = function(){
+        if (state.pos) Object.keys(state.pos).forEach(function(id){ if (cards[id]) { cards[id].x = state.pos[id].x; cards[id].y = state.pos[id].y; } });
+        _applyAllPos(); _drawEdges();
+        if (state.pan) { pan.x = state.pan.x; pan.y = state.pan.y; pan.s = state.pan.s; _applyTransform(); }
+        if (state.search && searchInput) { searchInput.value = state.search; _applyFilter(state.search); }
+      };
+      requestAnimationFrame(apply);
+    }
+  };
 })();
 </script>
 """

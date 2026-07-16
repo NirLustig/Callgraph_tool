@@ -1539,6 +1539,12 @@ class CParser(BaseParser):
         # Tree-sitter Parser is not thread-safe — give each worker thread its own.
         import threading
         self._tls = threading.local()
+        # Type Nodes Mode: raw TypeDef records collected per-file, merged here
+        # under a lock (keyed by provisional type_id) so the builder sees every
+        # struct/union/enum/typedef across the project. Same side-channel pattern
+        # as the C++ class_registry.
+        self.type_registry: dict = {}
+        self._type_lock = threading.Lock()
 
     def _get_parser(self) -> "TSParser":
         p = getattr(self._tls, "parser", None)
@@ -1563,6 +1569,21 @@ class CParser(BaseParser):
                    file_variables=file_variables)
 
         _attach_referenced_globals(functions, file_variables, source_bytes)
+
+        # Type Nodes Mode: collect struct/union/enum/typedef definitions and
+        # merge into the shared registry (header may be parsed by many TUs).
+        if getattr(self.config.output, "type_mode", True):
+            try:
+                from ._type_extract import extract_types_from_tree
+                type_defs = extract_types_from_tree(
+                    tree.root_node, source_bytes, str(path), self.LANGUAGE_NAME
+                )
+                if type_defs:
+                    with self._type_lock:
+                        for td in type_defs:
+                            self.type_registry.setdefault(td.type_id, td)
+            except Exception:
+                pass   # type extraction never breaks the parse (graceful degradation)
 
         return functions, calls
 

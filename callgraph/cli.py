@@ -412,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     all_calls = []
     parse_errors = []
     class_registry = {}   # qualified class name → ClassInfo (C++ virtual dispatch)
+    type_registry = {}    # type_id → TypeDef (Type Nodes Mode)
 
     with Progress(
         SpinnerColumn(),
@@ -439,6 +440,12 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         master.bases.update(info.bases)
                         master.virtual_methods.update(info.virtual_methods)
+            # Collect type definitions for Type Nodes Mode (TM).
+            treg = getattr(parser, "type_registry", None)
+            if treg:
+                for tid, td in treg.items():
+                    if tid not in type_registry:
+                        type_registry[tid] = td
 
     console.print(f"  Parsed [green]{len(all_functions)}[/green] functions, "
                   f"[green]{len(all_calls)}[/green] raw calls, "
@@ -455,6 +462,15 @@ def main(argv: list[str] | None = None) -> int:
                              class_registry=class_registry)
     graph.build_info = build_info
     graph.project_root = str(project_root.resolve())
+
+    # Type Nodes Mode: assemble the type graph as a side artifact on the CallGraph.
+    if type_registry:
+        try:
+            from .graph.type_builder import build_type_graph_from_callgraph
+            graph.type_graph = build_type_graph_from_callgraph(graph, type_registry)
+        except Exception as exc:  # graceful degradation — never break the main run
+            if args.verbose:
+                console.print(f"  [dim yellow]Type mode skipped:[/dim yellow] {exc}")
 
     # G10: MATLAB project / search-path metadata (analogue of BuildInfo for C/C++).
     if files.get(Language.MATLAB):
