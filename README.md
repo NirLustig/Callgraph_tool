@@ -19,7 +19,8 @@ CallGraph Analyzer scans your source code and produces a **fully self-contained 
 | **Include Graph** | Maps `#include` dependency chains for C/C++ projects |
 | **Architecture rules** | Define forbidden dependencies, allowed-only edges, layering rules in YAML — violations shown as red edges |
 | **Script Nodes** | File-level view with collapsible cards, callee badges colour-coded by location (same file / other file / external) |
-| **Function Nodes** | Function-level canvas with drag, search, isolate, highlight, and depth-limited traversal |
+| **Function Nodes** | Function-level canvas where each node is a syntax-highlighted source signature with a language-coloured contour; includes drag, search, isolate, highlight, depth-limited traversal, and a minimap overview |
+| **Type Nodes** | Struct / union / enum / typedef / class graph for C/C++ — cards list members and field types, with type-to-type reference edges, plus its own search, isolate, and layout |
 | **Module View** | Aggregated module-level graph auto-inferred from folder structure or YAML config |
 | **Nodebook** | Capture any view as a restorable "favorites" page (live state, not a screenshot) — reopen, rename, reorder, export/import |
 | **Visual Studio .sln** | Reads `.sln` + `.vcxproj` to discover and analyse all C/C++ source files automatically |
@@ -278,7 +279,7 @@ The sidebar on the left switches between view modes. The **dark/light theme togg
 | **Pan** | Click and hold the **mouse wheel** (middle button) + drag |
 | **Zoom** | Scroll wheel |
 | **Dark / Light theme** | Toggle button next to *CallGraph Analyzer* title |
-| **Search** | Type a function or file name in the search box + Enter |
+| **Search** | Type in the search box + Enter — the box adapts to the active mode (functions, files, modules, variables, or **types**) |
 | **Fit view** | Click *Fit* to zoom-to-fit all visible content |
 
 ### Confidence edge colours (Function / Module / Include modes)
@@ -294,7 +295,9 @@ The sidebar on the left switches between view modes. The **dark/light theme togg
 
 ### 🔵 Mode 1 — Function Nodes
 
-**What it shows:** One node per function. Edges are call relationships. This is the default starting mode and the most detailed view.
+**What it shows:** One node per function, rendered as a **syntax-highlighted source signature** (return type, name, and typed parameters — coloured like code). Each node carries a **contour in its language colour** (Python blue, C orange, C++ green, MATLAB purple, external gray) so nodes stay distinct at any zoom level. Edges are call relationships. This is the default starting mode and the most detailed view.
+
+A **minimap** in the bottom-right corner shows the whole graph plus your current viewport — click or drag on it to jump around large graphs. Toggle it with the **🗺 Minimap** button in *View controls*.
 
 **How to use:**
 
@@ -304,8 +307,9 @@ The sidebar on the left switches between view modes. The **dark/light theme togg
 | Full inspection | Double-click a node → opens a **modal** with full signature, all callers, all callees, variable annotations, and resolution reason |
 | Drag a node | Click-and-hold then drag — positions are saved in browser `localStorage` automatically |
 | Multi-select nodes | Click-and-drag on empty canvas to draw a **selection rectangle** |
-| Search | Type in the search box + Enter → matching nodes are highlighted yellow |
+| Search | Type in the search box + Enter → matching nodes are selected and centred |
 | Highlight | After searching, click *Highlight* to zoom to the first match |
+| Minimap | Toggle the overview minimap with **🗺 Minimap**; click or drag it to navigate |
 | Isolate | Select a node → click *Isolate* → hides everything **except** that node and its call tree |
 | Expand | Select a node → click *Expand* → makes reachable nodes visible without hiding others |
 | Clear isolation | Click *Show All* to restore all hidden nodes |
@@ -444,6 +448,31 @@ include_graph:
 
 ---
 
+### 🧬 Mode 6 — Type Nodes
+
+**What it shows:** One **card** per type (struct, union, enum, typedef, or C++ class) discovered in C/C++ source. Each card lists the type's members with their field types syntax-highlighted; edges connect a type to the other types it references (e.g. a struct field whose type is another struct). Enum cards list their values. This mode only appears when the analysed project contains type definitions.
+
+**Enable it:** Type extraction runs automatically for C/C++ projects — open the HTML and click the **🧬 Type Mode** button (or press **T**).
+
+**How to use:**
+
+| Action | How |
+|---|---|
+| Search types | Type a **type, tag, alias, field, or enum value** name in the sidebar search box → matching cards are highlighted and the rest dimmed; click a result (or press Enter) to focus it |
+| Select a type | Single-click a card → highlights it |
+| Isolate | Select a type → *Isolate* → shows only that type and the types it references (respects the Depth + Direction controls) |
+| Expand | Select a type → *Expand* → reveals related types without hiding the rest |
+| Center / focus | Search or click a result to pan-and-flash the matching type card |
+| Drag a card | Click-and-hold then drag — positions are saved in `localStorage` |
+| Fit / Show all / Reset layout | Same controls as Function mode |
+| Jump from a variable | In Variable Flow mode, a type chip's **open** button jumps straight into this mode focused on that type |
+
+**Tips:**
+- Great for understanding **data-structure relationships** — which structs embed or point to which.
+- The sidebar search matches **member/field names and enum values**, not just type names — handy for finding "which type has a field called `mode`".
+
+---
+
 ## 📓 Nodebook — saved view favorites
 
 The **Nodebook** is a personal favorites book baked into every generated HTML. Capture the
@@ -503,7 +532,7 @@ pytest tests/test_macro_expand.py -v
 pytest tests/test_fp_resolution.py -v
 ```
 
-Current test count: **214 tests**.
+Current test count: **398 tests**.
 
 ---
 
